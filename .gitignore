@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Test & Coverage
+coverage/
+
+# Environment & Local secrets
+.env
+.env.local
+
+# OS Files
+Thumbs.db
+.DS_Store
+
+# Log files
+*.log
