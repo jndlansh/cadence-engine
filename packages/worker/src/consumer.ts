@@ -25,9 +25,21 @@ function buildTaskDefinition(payload: StreamTaskPayload): TaskDefinition {
   };
 }
 
-type XReadGroupReply =
-  | null
-  | Array<[string, Array<[string, Record<string, string>]>]>;
+type StreamEntry = [string, string[]];
+type XReadGroupReply = null | Array<[string, StreamEntry[]]>;
+
+/**
+ * Redis returns stream entry fields as a flat [field, value, field, value]
+ * array — not as an object — so `fields["taskId"]` would always be undefined.
+ * Fold the flat array into a lookup map.
+ */
+export function fieldsToRecord(flat: string[]): Record<string, string> {
+  const record: Record<string, string> = {};
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    record[flat[i]] = flat[i + 1];
+  }
+  return record;
+}
 
 export class WorkerConsumer {
   private redis: Redis;
@@ -72,9 +84,9 @@ export class WorkerConsumer {
         for (const [, entries] of messages) {
           if (this.shutdownRequested) break;
 
-          for (const [entryId, fields] of entries) {
+          for (const [entryId, flatFields] of entries) {
             if (this.shutdownRequested) break;
-            await this.handleMessage(entryId, fields);
+            await this.handleMessage(entryId, fieldsToRecord(flatFields));
           }
         }
       } catch (err: unknown) {

@@ -10,15 +10,17 @@ Cadence is an asynchronous, distributed, fault-tolerant DAG (Directed Acyclic Gr
 ---
 
 ## 2. Monorepo Repository Structure
-Managed via `pnpm` workspaces:
+Managed via `pnpm` workspaces. Entries marked `[planned]` are roadmap targets and do **not** exist on disk yet.
 ```text
 cadence/
-├── ARCHITECTURE.md                  # System design contract, phases & agent rules
-├── docker-compose.yml              # Local infrastructure container (Redis 7)
+├── architectue.md                   # System design contract, phases & agent rules (filename is misspelled)
+├── docker-compose.yml              # Redis 7 container (Docker path; Memurai used natively on Windows)
 ├── package.json                    # Workspace root scripts & tooling
 ├── pnpm-workspace.yaml             # Workspace definitions
 ├── tsconfig.json                   # Shared TypeScript compiler configuration
-├── workflows/                       # Example workflow YAML manifests
+├── scripts/
+│   └── smoke-phase3.ts             # Live Redis dispatch + consume smoke test (Phase 3)
+├── workflows/                       # Example workflow YAML manifests   [planned — Phase 6]
 │   └── data-pipeline.yaml          # Sample multi-stage DAG workflow
 └── packages/
     ├── core/                        # Pure domain engine, schemas & process execution
@@ -32,13 +34,17 @@ cadence/
     │   └── src/index.ts             # Core package barrel export
     ├── orchestrator/                # Coordination layer & scheduler daemon
     │   ├── src/scheduler.ts         # Redis Streams task dispatcher (XADD)
-    │   ├── src/state.ts             # Global workflow run state manager
-    │   ├── src/reclaimer.ts         # Stale task cleaner (XCLAIM & worker health)
-    │   └── src/index.ts             # Orchestrator entry point
+    │   ├── src/state.ts             # Global workflow run state manager   [planned — Phase 5]
+    │   ├── src/reclaimer.ts         # Stale task cleaner (XCLAIM & worker health)   [planned — Phase 4]
+    │   └── src/index.ts             # Orchestrator barrel export
     └── worker/                      # Independent task runner node
         ├── src/consumer.ts          # Redis Streams consumer loop (XREADGROUP)
-        ├── src/heartbeat.ts         # Periodic liveness beacon (Redis TTL keys)
-        └── src/index.ts             # Worker CLI entry point
+        ├── src/consumer.test.ts     # Vitest suite for stream field parsing
+        ├── src/heartbeat.ts         # Periodic liveness beacon (Redis TTL keys)   [planned — Phase 4]
+        └── src/index.ts             # Worker barrel export
+```
+
+---
 
 ## 3. Core Architectural Phases & Roadmap
 
@@ -51,36 +57,42 @@ cadence/
 - [x] Implemented YAML parsing and validation bridge (`parseWorkflowYAML`).
 - [x] Full unit test coverage passing in Vitest.
 
-### Phase 2: Process Execution Layer (`TaskRunner`) `[STATUS: IN PROGRESS]`
+### Phase 2: Process Execution Layer (`TaskRunner`) `[STATUS: COMPLETED]`
 
-- [ ] Child process execution engine using Node.js `child_process.spawn`.
-- [ ] Cross-platform shell wrapping (`cmd.exe /c` on Windows, `sh -c` on POSIX).
-- [ ] Process timeout guard: forcefully terminates hung processes (`SIGKILL`) after `timeout_ms`.
-- [ ] Buffered stdout and stderr capture with normalized exit codes.
-- [ ] Execution unit tests validating exit codes, log streaming, and timeout interruptions.
+- [x] Child process execution engine using Node.js `child_process.spawn`.
+- [x] Cross-platform shell wrapping (`cmd.exe /c` on Windows, `sh -c` on POSIX).
+- [x] Process timeout guard: forcefully terminates hung processes (`SIGKILL` on POSIX, `taskkill /T /F` on Windows) after `timeout_ms`.
+- [x] Buffered stdout and stderr capture with normalized exit codes (timeout maps to the POSIX convention `124`).
+- [x] Execution unit tests validating exit codes, log streaming, and timeout interruptions.
 
-### Phase 3: Distributed State & Queue Infrastructure (Redis Streams)
+### Phase 3: Distributed State & Queue Infrastructure (Redis Streams) `[STATUS: COMPLETED]`
 
-- [ ] Redis client initialization and connection management using `ioredis`.
-- [ ] Task queuing primitive: publish unlocked tasks to Redis Stream `cadence:tasks` using `XADD`.
-- [ ] Consumer Group configuration (`XGROUP CREATE`) enabling parallel, load-balanced worker consumption.
-- [ ] Explicit delivery acknowledgment (`XACK`) once a task exits cleanly.
-- [ ] Dead Letter Queue (DLQ) routing for tasks exceeding maximum configured retries.
+- [x] Redis client initialization and connection management using `ioredis`.
+- [x] Task queuing primitive: publish unlocked tasks to Redis Stream `cadence:tasks` using `XADD`.
+- [x] Consumer Group configuration (`XGROUP CREATE`) enabling parallel, load-balanced worker consumption.
+- [x] Explicit delivery acknowledgment (`XACK`) once a task exits cleanly.
+- [x] Dead Letter Queue (DLQ) routing for tasks exceeding maximum configured retries.
 
-### Phase 4: Heartbeats, Task Reclaiming & Worker Fault Tolerance
+> **Verified** end-to-end against a live Redis (Memurai, native Windows) via `pnpm exec tsx scripts/smoke-phase3.ts`:
+> happy path (`COMPLETED` + `XACK`), retry escalation, timeout kill (`exitCode 124`), and DLQ routing.
+>
+> Scope note: retries and DLQ routing live in the **worker** (`consumer.ts`), not the orchestrator.
+> The orchestrator only dispatches and ensures the consumer group. PEL reclamation is deferred to Phase 4.
+
+### Phase 4: Heartbeats, Task Reclaiming & Worker Fault Tolerance `[STATUS: NOT STARTED]`
 
 - [ ] Worker Liveness Beacon: workers maintain an ephemeral key with TTL in Redis (`SET worker:<id>:heartbeat "alive" EX 10`) renewed every 3 seconds.
 - [ ] Orchestrator Reclaimer Loop: background sweeper inspecting the Pending Entries List (PEL) via `XPENDING`.
 - [ ] Automatic Failover (`XCLAIM`): if a task is un-acked and its assigned worker's heartbeat key expires, reassign the task to an active worker.
 - [ ] Exponential backoff scheduler for failed tasks using Redis Sorted Sets (`ZSET`).
 
-### Phase 5: Workflow State Machine & Lifecycle Persistence
+### Phase 5: Workflow State Machine & Lifecycle Persistence `[STATUS: NOT STARTED]`
 
 - [ ] Workflow lifecycle state management: `PENDING` $\to$ `RUNNING` $\to$ `COMPLETED` | `FAILED`.
 - [ ] Tracking task execution attempts, execution latency, and error states.
 - [ ] Structured file/console event logger.
 
-### Phase 6: Orchestrator CLI & Workflow Submission
+### Phase 6: Orchestrator CLI & Workflow Submission `[STATUS: NOT STARTED]`
 
 - [ ] CLI runner to trigger workflows: `pnpm cadence run ./workflows/data-pipeline.yaml`.
 - [ ] Live terminal progress bar rendering active, completed, and failed tasks in real-time.
@@ -105,7 +117,12 @@ Any AI assistant modifying or contributing to this repository **MUST** strictly 
 3. **Cross-Platform Compatibility**
    - Do not assume a Linux environment. The code must run seamlessly across Windows (`cmd.exe`/PowerShell) and POSIX (`sh`/`bash`).
    - Use Node.js standard library path modules (`node:path`, `node:child_process`) rather than hardcoded slash paths.
+   - On Windows, Redis (Memurai) binds IPv4 only. Prefer `redis://127.0.0.1:6379` over `localhost`, since Node >= 18 resolves `localhost` verbatim and may attempt `::1` first.
 
 4. **Mandatory Test-Driven Quality**
    - Every algorithmic change, edge-case fix, or utility function must include a unit test in a corresponding `*.test.ts` file.
    - All changes must pass `pnpm test` with zero failures before being considered complete.
+
+5. **Live Verification for Queue & Stream Code**
+   - Unit tests are necessary but never sufficient for Redis Streams code. Any change to `scheduler.ts` or `consumer.ts` must be exercised against a running Redis with `scripts/smoke-phase3.ts`.
+   - Redis returns stream entry fields as a **flat `[field, value, field, value, ...]` array**, not an object. Never index entry fields by key without folding them first — doing so silently discards every task.
