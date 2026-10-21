@@ -1,6 +1,7 @@
 import { Redis } from "ioredis";
 import {
   TaskRunner,
+  type TaskCompletion,
   type TaskDefinition,
   type TaskExecutionResult,
 } from "@cadence/core";
@@ -8,6 +9,7 @@ import {
 const TASKS_STREAM = "cadence:tasks";
 const GROUP_NAME = "cadence:workers";
 const DLQ_STREAM = "cadence:tasks:dlq";
+const COMPLETION_STREAM = "cadence:completions";
 // 127.0.0.1 rather than localhost: on Windows the Redis service binds IPv4 only,
 // and Node resolves localhost verbatim, so "localhost" can dial ::1 and fail.
 const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
@@ -145,6 +147,7 @@ export class WorkerConsumer {
       console.log(
         `[worker:${this.workerId}] Task ${task.id} completed (exit=${result.exitCode})`
       );
+      await this.publishCompletion(task, workflowId, attempt, result);
       await this.safeXack(messageId);
       return;
     }
@@ -163,6 +166,7 @@ export class WorkerConsumer {
         `[worker:${this.workerId}] Task ${task.id} exhausted retries (${maxRetries}), routing to DLQ`
       );
       await this.routeToDlq(task, workflowId, attempt, result);
+      await this.publishCompletion(task, workflowId, attempt, result);
     }
 
     await this.safeXack(messageId);
@@ -224,6 +228,39 @@ export class WorkerConsumer {
     );
 
     await this.safeXack(messageId);
+  }
+
+  /**
+   * Publish the terminal outcome of a task so the orchestrator can advance the
+   * DAG. Called before `safeXack`: a crash in between simply re-delivers the
+   * task and produces a duplicate completion, which the orchestrator treats
+   * idempotently.
+   */
+  private async publishCompletion(
+    task: TaskDefinition,
+    workflowId: string,
+    attempt: number,
+    result: TaskExecutionResult
+  ): Promise<void> {
+    const status: TaskCompletion["status"] =
+      result.status === "COMPLETED" ? "COMPLETED" : "FAILED";
+
+    await this.redis.xadd(
+      COMPLETION_STREAM,
+      "*",
+      "workflowId",
+      workflowId,
+      "taskId",
+      task.id,
+      "status",
+      status,
+      "attempt",
+      String(attempt),
+      "exitCode",
+      String(result.exitCode),
+      "durationMs",
+      String(result.durationMs)
+    );
   }
 
   private async safeXack(messageId: string): Promise<void> {

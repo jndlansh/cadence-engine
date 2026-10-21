@@ -58,3 +58,22 @@ export interface TaskRunnerOptions {
   /** Invoked for each chunk of stderr produced by the child process. */
   onStderr?: (chunk: string) => void;
 }
+
+/**
+ * Terminal outcome of a task, published by the worker to the completions stream
+ * so the orchestrator can advance the DAG.
+ *
+ * Only terminal states appear here: the worker retries internally, so the
+ * orchestrator never observes intermediate attempts. Numeric fields use
+ * `z.coerce` because Redis stream fields always arrive as strings.
+ */
+export const TaskCompletionSchema = z.object({
+  workflowId: z.string().min(1),
+  taskId: z.string().min(1),
+  status: z.enum(["COMPLETED", "FAILED"]),
+  attempt: z.coerce.number().int().positive(),
+  exitCode: z.coerce.number().int(),
+  durationMs: z.coerce.number().int().nonnegative(),
+});
+
+export type TaskCompletion = z.infer<typeof TaskCompletionSchema>;

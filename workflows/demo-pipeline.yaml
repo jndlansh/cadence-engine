@@ -1,0 +1,18 @@
+version: "1.0"
+workflow: demo_pipeline
+tasks:
+  - id: extract
+    command: echo extract
+  - id: transform_a
+    command: echo transform_a
+    depends_on:
+      - extract
+  - id: transform_b
+    command: echo transform_b
+    depends_on:
+      - extract
+  - id: load
+    command: echo load
+    depends_on:
+      - transform_a
+      - transform_b
