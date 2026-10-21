@@ -1,10 +1,16 @@
 import { Redis } from "ioredis";
-import { TaskRunner, type TaskDefinition } from "@cadence/core";
+import {
+  TaskRunner,
+  type TaskDefinition,
+  type TaskExecutionResult,
+} from "@cadence/core";
 
 const TASKS_STREAM = "cadence:tasks";
 const GROUP_NAME = "cadence:workers";
 const DLQ_STREAM = "cadence:tasks:dlq";
-const DEFAULT_REDIS_URL = "redis://localhost:6379";
+// 127.0.0.1 rather than localhost: on Windows the Redis service binds IPv4 only,
+// and Node resolves localhost verbatim, so "localhost" can dial ::1 and fail.
+const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
 
 interface StreamTaskPayload {
   workflowId: string;
@@ -120,8 +126,7 @@ export class WorkerConsumer {
     };
 
     if (!payload.taskId || !payload.command) {
-      // Malformed entry — acknowledge and discard.
-      await this.safeXack(messageId);
+      await this.quarantineMalformed(messageId, fields);
       return;
     }
 
@@ -134,54 +139,91 @@ export class WorkerConsumer {
       `[worker:${this.workerId}] Running task=${task.id} attempt=${attempt} workflow=${workflowId}`
     );
 
-    try {
-      const result = await this.runner.run(task, attempt, workflowId);
+    const result = await this.execute(task, attempt, workflowId);
 
-      if (result.status === "COMPLETED") {
-        console.log(
-          `[worker:${this.workerId}] Task ${task.id} completed (exit=${result.exitCode})`
-        );
-        await this.safeXack(messageId);
-        return;
-      }
-
-      // FAILED — decide between retry or DLQ.
-      if (attempt < maxRetries) {
-        console.log(
-          `[worker:${this.workerId}] Task ${task.id} failed (exit=${result.exitCode}), ` +
-            `retrying attempt=${attempt + 1}/${maxRetries}`
-        );
-        await this.safeXack(messageId);
-        await this.redispatch(task, workflowId, attempt + 1);
-      } else {
-        console.log(
-          `[worker:${this.workerId}] Task ${task.id} exhausted retries (${maxRetries}), routing to DLQ`
-        );
-        await this.safeXack(messageId);
-        await this.routeToDlq(task, workflowId, attempt, result);
-      }
-    } catch (err: unknown) {
-      // Unexpected execution error — treat as failed attempt.
-      console.error(`[worker:${this.workerId}] Task ${task.id} threw:`, err);
+    if (result.status === "COMPLETED") {
+      console.log(
+        `[worker:${this.workerId}] Task ${task.id} completed (exit=${result.exitCode})`
+      );
       await this.safeXack(messageId);
-      if (attempt < maxRetries) {
-        await this.redispatch(task, workflowId, attempt + 1);
-      } else {
-        await this.routeToDlq(
-          task,
-          workflowId,
-          attempt,
-          {
-            exitCode: 1,
-            stdout: "",
-            stderr: err instanceof Error ? err.message : String(err),
-            timedOut: false,
-            durationMs: 0,
-            error: err instanceof Error ? err : new Error(String(err)),
-          }
-        );
-      }
+      return;
     }
+
+    // Publish the follow-up BEFORE acknowledging. If the process dies between
+    // the publish and the ack, the entry is still pending in the PEL and can be
+    // recovered. Acknowledging first would lose the task outright.
+    if (attempt < maxRetries) {
+      console.log(
+        `[worker:${this.workerId}] Task ${task.id} failed (exit=${result.exitCode}), ` +
+          `retrying attempt=${attempt + 1}/${maxRetries}`
+      );
+      await this.redispatch(task, workflowId, attempt + 1);
+    } else {
+      console.log(
+        `[worker:${this.workerId}] Task ${task.id} exhausted retries (${maxRetries}), routing to DLQ`
+      );
+      await this.routeToDlq(task, workflowId, attempt, result);
+    }
+
+    await this.safeXack(messageId);
+  }
+
+  /**
+   * Execute a task, converting an unexpected runner rejection into a FAILED
+   * result. Scoping the try/catch to the runner alone keeps bookkeeping
+   * (XADD/XACK) failures from being mistaken for task failures.
+   */
+  private async execute(
+    task: TaskDefinition,
+    attempt: number,
+    workflowId: string
+  ): Promise<TaskExecutionResult> {
+    try {
+      return await this.runner.run(task, attempt, workflowId);
+    } catch (err: unknown) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      console.error(`[worker:${this.workerId}] Task ${task.id} threw:`, error);
+      return {
+        taskId: task.id,
+        invocationId: `run_${workflowId}_${task.id}_${attempt}`,
+        status: "FAILED",
+        exitCode: 1,
+        stdout: "",
+        stderr: error.message,
+        timedOut: false,
+        durationMs: 0,
+        error,
+      };
+    }
+  }
+
+  /**
+   * Handle an entry that is missing required fields: publish the raw entry to
+   * the DLQ so it is visible and recoverable, then acknowledge. Never discard
+   * silently — that is how the flat-array bug went unnoticed.
+   */
+  private async quarantineMalformed(
+    messageId: string,
+    fields: Record<string, string>
+  ): Promise<void> {
+    const raw = JSON.stringify(fields);
+    console.error(
+      `[worker:${this.workerId}] Malformed entry ${messageId} (missing taskId or command) ` +
+        `— routing to DLQ. fields=${raw}`
+    );
+
+    await this.redis.xadd(
+      DLQ_STREAM,
+      "*",
+      "reason",
+      "MALFORMED_ENTRY",
+      "messageId",
+      messageId,
+      "fields",
+      raw
+    );
+
+    await this.safeXack(messageId);
   }
 
   private async safeXack(messageId: string): Promise<void> {

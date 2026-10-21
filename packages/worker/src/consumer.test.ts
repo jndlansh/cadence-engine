@@ -1,5 +1,55 @@
-import { describe, it, expect } from "vitest";
-import { fieldsToRecord } from "./consumer.js";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  type MockInstance,
+} from "vitest";
+import { WorkerConsumer, fieldsToRecord } from "./consumer.js";
+
+const TASKS_STREAM = "cadence:tasks";
+const DLQ_STREAM = "cadence:tasks:dlq";
+
+const redisMock = vi.hoisted(() => {
+  const calls: string[] = [];
+  const published: string[] = [];
+  return {
+    calls,
+    published,
+    xadd: vi.fn(async (stream: string) => {
+      calls.push(stream === "cadence:tasks:dlq" ? "XADD:dlq" : "XADD:tasks");
+      published.push(stream);
+      return "1-0";
+    }),
+    xack: vi.fn(async () => {
+      calls.push("XACK");
+      return 1;
+    }),
+    xgroup: vi.fn(async () => "OK"),
+    call: vi.fn(async () => null),
+    quit: vi.fn(() => "OK"),
+  };
+});
+
+vi.mock("ioredis", () => ({
+  Redis: class {
+    xadd = redisMock.xadd;
+    xack = redisMock.xack;
+    xgroup = redisMock.xgroup;
+    call = redisMock.call;
+    quit = redisMock.quit;
+  },
+}));
+
+type ConsumerInternals = {
+  handleMessage(messageId: string, fields: Record<string, string>): Promise<void>;
+};
+
+function internals(consumer: WorkerConsumer): ConsumerInternals {
+  return consumer as unknown as ConsumerInternals;
+}
 
 describe("fieldsToRecord", () => {
   it("folds a flat field/value array into a lookup record", () => {
@@ -40,5 +90,102 @@ describe("fieldsToRecord", () => {
 
   it("keeps the last occurrence of a duplicated field", () => {
     expect(fieldsToRecord(["a", "1", "a", "2"])).toEqual({ a: "2" });
+  });
+});
+
+describe("WorkerConsumer.handleMessage", () => {
+  let logSpy: MockInstance;
+
+  beforeEach(() => {
+    redisMock.calls.length = 0;
+    redisMock.published.length = 0;
+    redisMock.xadd.mockClear();
+    redisMock.xack.mockClear();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  it("acks a completed task and publishes nothing further", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("1-0", {
+      workflowId: "w1",
+      taskId: "ok",
+      command: "echo done",
+      timeoutMs: "5000",
+      retries: "0",
+      attempt: "1",
+    });
+
+    expect(redisMock.calls).toEqual(["XACK"]);
+    expect(redisMock.xadd).not.toHaveBeenCalled();
+  });
+
+  it("re-publishes the retry BEFORE acknowledging", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("2-0", {
+      workflowId: "w1",
+      taskId: "flaky",
+      command: 'node -e "process.exit(3)"',
+      timeoutMs: "5000",
+      retries: "3",
+      attempt: "1",
+    });
+
+    expect(redisMock.calls).toEqual(["XADD:tasks", "XACK"]);
+    expect(redisMock.published).toEqual([TASKS_STREAM]);
+  });
+
+  it("routes to the DLQ BEFORE acknowledging once retries are exhausted", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("3-0", {
+      workflowId: "w1",
+      taskId: "doomed",
+      command: 'node -e "process.exit(7)"',
+      timeoutMs: "5000",
+      retries: "1",
+      attempt: "1",
+    });
+
+    expect(redisMock.calls).toEqual(["XADD:dlq", "XACK"]);
+    expect(redisMock.published).toEqual([DLQ_STREAM]);
+  });
+
+  it("never acknowledges when the follow-up publish fails (crash-window safety)", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+    redisMock.xadd.mockRejectedValueOnce(new Error("redis down"));
+
+    await expect(
+      internals(consumer).handleMessage("4-0", {
+        workflowId: "w1",
+        taskId: "flaky",
+        command: 'node -e "process.exit(3)"',
+        timeoutMs: "5000",
+        retries: "3",
+        attempt: "1",
+      })
+    ).rejects.toThrow("redis down");
+
+    // The entry must remain pending in the PEL so it stays recoverable.
+    expect(redisMock.xack).not.toHaveBeenCalled();
+  });
+
+  it("quarantines a malformed entry to the DLQ instead of discarding it", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await internals(consumer).handleMessage("5-0", { workflowId: "w1" });
+
+    expect(redisMock.calls).toEqual(["XADD:dlq", "XACK"]);
+    expect(redisMock.published).toEqual([DLQ_STREAM]);
+    expect(redisMock.xadd.mock.calls[0]).toContain("MALFORMED_ENTRY");
+    expect(errorSpy).toHaveBeenCalled();
+
+    errorSpy.mockRestore();
   });
 });

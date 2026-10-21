@@ -8,8 +8,10 @@ export class TaskDispatcher {
   private redis: Redis;
 
   constructor(redisUrl?: string) {
+    // 127.0.0.1 rather than localhost: on Windows the Redis service binds IPv4
+    // only, and Node resolves localhost verbatim, so "localhost" can hit ::1.
     this.redis = new Redis(
-      redisUrl || process.env.REDIS_URL || "redis://localhost:6379"
+      redisUrl || process.env.REDIS_URL || "redis://127.0.0.1:6379"
     );
   }
 
