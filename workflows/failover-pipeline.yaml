@@ -1,0 +1,13 @@
+version: "1.0"
+workflow: failover_pipeline
+tasks:
+  - id: long_task
+    command: 'node -e "setTimeout(function(){}, 4000)"'
+    retries: 3
+    timeout_ms: 30000
+  - id: after_task
+    command: echo after-failover
+    depends_on:
+      - long_task
+    retries: 0
+    timeout_ms: 10000

@@ -10,3 +10,9 @@ export {
   type WorkflowRunStatus,
 } from "./orchestrator.js";
 export { RedisCompletionSource, parseCompletionEntry } from "./completions.js";
+export {
+  TaskReclaimer,
+  type PendingEntry,
+  type ReclaimerOptions,
+  type SweepResult,
+} from "./reclaimer.js";

@@ -1,18 +1,22 @@
 import { Redis } from "ioredis";
 import {
   TaskRunner,
+  COMPLETION_STREAM,
+  DEFAULT_REDIS_URL,
+  DLQ_STREAM,
+  TASKS_STREAM,
+  WORKER_GROUP as GROUP_NAME,
+  foldStreamFields,
   type TaskCompletion,
   type TaskDefinition,
   type TaskExecutionResult,
 } from "@cadence/core";
+import { WorkerHeartbeat, type HeartbeatOptions } from "./heartbeat.js";
 
-const TASKS_STREAM = "cadence:tasks";
-const GROUP_NAME = "cadence:workers";
-const DLQ_STREAM = "cadence:tasks:dlq";
-const COMPLETION_STREAM = "cadence:completions";
-// 127.0.0.1 rather than localhost: on Windows the Redis service binds IPv4 only,
-// and Node resolves localhost verbatim, so "localhost" can dial ::1 and fail.
-const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
+export interface WorkerConsumerOptions {
+  /** Liveness-beacon tuning; the demo shrinks these to fail fast. */
+  heartbeat?: HeartbeatOptions;
+}
 
 interface StreamTaskPayload {
   workflowId: string;
@@ -42,24 +46,24 @@ type XReadGroupReply = null | Array<[string, StreamEntry[]]>;
  * Fold the flat array into a lookup map.
  */
 export function fieldsToRecord(flat: string[]): Record<string, string> {
-  const record: Record<string, string> = {};
-  for (let i = 0; i + 1 < flat.length; i += 2) {
-    record[flat[i]] = flat[i + 1];
-  }
-  return record;
+  return foldStreamFields(flat);
 }
 
 export class WorkerConsumer {
   private redis: Redis;
   private workerId: string;
   private runner: TaskRunner;
+  private readonly redisUrl: string;
+  private readonly heartbeatOptions?: HeartbeatOptions;
+  private heartbeat: WorkerHeartbeat | null = null;
   private shutdownRequested = false;
 
-  constructor(redisUrl?: string) {
-    const url = redisUrl || process.env.REDIS_URL || DEFAULT_REDIS_URL;
-    this.redis = new Redis(url);
+  constructor(redisUrl?: string, options?: WorkerConsumerOptions) {
+    this.redisUrl = redisUrl || process.env.REDIS_URL || DEFAULT_REDIS_URL;
+    this.redis = new Redis(this.redisUrl);
     this.workerId = `worker_${process.pid}_${Date.now()}`;
     this.runner = new TaskRunner();
+    this.heartbeatOptions = options?.heartbeat;
   }
 
   /**
@@ -68,6 +72,14 @@ export class WorkerConsumer {
    */
   async start(): Promise<void> {
     console.log(`[worker:${this.workerId}] Starting consumer (group=${GROUP_NAME})`);
+
+    // Announce liveness so the reclaimer can tell a crash apart from a slow task.
+    this.heartbeat = new WorkerHeartbeat(
+      this.workerId,
+      this.redisUrl,
+      this.heartbeatOptions
+    );
+    await this.heartbeat.start();
 
     while (!this.shutdownRequested) {
       try {
@@ -110,7 +122,16 @@ export class WorkerConsumer {
       }
     }
 
+    await this.stopHeartbeat();
+
     console.log(`[worker:${this.workerId}] Consumer loop exiting`);
+  }
+
+  private async stopHeartbeat(): Promise<void> {
+    if (this.heartbeat) {
+      await this.heartbeat.disconnect();
+      this.heartbeat = null;
+    }
   }
 
   private async handleMessage(
@@ -362,6 +383,7 @@ export class WorkerConsumer {
    * Gracefully close the Redis connection.
    */
   async disconnect(): Promise<void> {
+    await this.stopHeartbeat();
     // quit() returns "OK" | null synchronously; explicitly discard the value.
     void this.redis.quit();
   }

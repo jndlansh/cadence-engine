@@ -1,33 +1,22 @@
 import { Redis } from "ioredis";
-import { TaskCompletionSchema, type TaskCompletion } from "@cadence/core";
+import {
+  COMPLETION_STREAM,
+  DEFAULT_REDIS_URL,
+  TaskCompletionSchema,
+  foldStreamFields,
+  type TaskCompletion,
+} from "@cadence/core";
 import type { CompletionSource } from "./orchestrator.js";
-
-const COMPLETION_STREAM = "cadence:completions";
-// 127.0.0.1 rather than localhost: the Windows Redis binds IPv4 only, and Node
-// resolves `localhost` verbatim so it may dial ::1 and fail.
-const DEFAULT_REDIS_URL = "redis://127.0.0.1:6379";
 
 type StreamEntry = [string, string[]];
 type XReadReply = null | Array<[string, StreamEntry[]]>;
-
-/**
- * Redis returns stream entry fields as a flat [field, value, field, value]
- * array — never an object — so fold the pairs before indexing.
- */
-function toRecord(flat: string[]): Record<string, string> {
-  const record: Record<string, string> = {};
-  for (let i = 0; i + 1 < flat.length; i += 2) {
-    record[flat[i]] = flat[i + 1];
-  }
-  return record;
-}
 
 /**
  * Fold and validate one completion entry. Returns null (loudly) for anything
  * that does not satisfy the contract rather than throwing into the read loop.
  */
 export function parseCompletionEntry(flatFields: string[]): TaskCompletion | null {
-  const parsed = TaskCompletionSchema.safeParse(toRecord(flatFields));
+  const parsed = TaskCompletionSchema.safeParse(foldStreamFields(flatFields));
 
   if (!parsed.success) {
     const details = parsed.error.issues

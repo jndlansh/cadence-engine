@@ -1,18 +1,16 @@
 import { Redis } from "ioredis";
-import { TaskDefinition } from "@cadence/core";
-
-const STREAM_KEY = "cadence:tasks";
-const GROUP_NAME = "cadence:workers";
+import {
+  DEFAULT_REDIS_URL,
+  TASKS_STREAM as STREAM_KEY,
+  WORKER_GROUP as GROUP_NAME,
+  type TaskDefinition,
+} from "@cadence/core";
 
 export class TaskDispatcher {
   private redis: Redis;
 
   constructor(redisUrl?: string) {
-    // 127.0.0.1 rather than localhost: on Windows the Redis service binds IPv4
-    // only, and Node resolves localhost verbatim, so "localhost" can hit ::1.
-    this.redis = new Redis(
-      redisUrl || process.env.REDIS_URL || "redis://127.0.0.1:6379"
-    );
+    this.redis = new Redis(redisUrl || process.env.REDIS_URL || DEFAULT_REDIS_URL);
   }
 
   /**
