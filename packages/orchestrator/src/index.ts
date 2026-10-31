@@ -16,3 +16,8 @@ export {
   type ReclaimerOptions,
   type SweepResult,
 } from "./reclaimer.js";
+export {
+  RetryPromoter,
+  type PromoteResult,
+  type RetryPromoterOptions,
+} from "./promoter.js";

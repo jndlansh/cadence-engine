@@ -24,6 +24,7 @@ import {
   type OrchestrationEvent,
 } from "../packages/orchestrator/src/orchestrator.js";
 import { RedisCompletionSource } from "../packages/orchestrator/src/completions.js";
+import { RetryPromoter } from "../packages/orchestrator/src/promoter.js";
 import { WorkerConsumer } from "../packages/worker/src/consumer.js";
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -90,12 +91,16 @@ async function main(): Promise<void> {
 
   const dispatcher = new TaskDispatcher(REDIS_URL);
   const completions = new RedisCompletionSource(REDIS_URL);
-  const worker = new WorkerConsumer(REDIS_URL);
+  const worker = new WorkerConsumer(REDIS_URL, {
+    backoff: { baseDelayMs: 500, maxDelayMs: 2000 },
+  });
+  const promoter = new RetryPromoter(REDIS_URL, { pollIntervalMs: 300 });
 
   await dispatcher.ensureGroup();
   console.log(`[demo] group ensured; worker=${worker.getWorkerId()}`);
 
   const workerLoop = worker.start();
+  await promoter.start();
 
   const orchestrator = new WorkflowOrchestrator(dispatcher, completions, {
     completionTimeoutMs: COMPLETION_TIMEOUT_MS,
@@ -105,6 +110,7 @@ async function main(): Promise<void> {
 
   worker.requestShutdown();
   await workerLoop;
+  await promoter.disconnect();
   await worker.disconnect();
   await completions.disconnect();
   await dispatcher.disconnect();

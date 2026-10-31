@@ -4,9 +4,13 @@ import {
   COMPLETION_STREAM,
   DEFAULT_REDIS_URL,
   DLQ_STREAM,
+  RETRY_ZSET,
   TASKS_STREAM,
   WORKER_GROUP as GROUP_NAME,
+  computeBackoffDelayMs,
+  encodeRetryPayload,
   foldStreamFields,
+  type BackoffOptions,
   type TaskCompletion,
   type TaskDefinition,
   type TaskExecutionResult,
@@ -16,6 +20,8 @@ import { WorkerHeartbeat, type HeartbeatOptions } from "./heartbeat.js";
 export interface WorkerConsumerOptions {
   /** Liveness-beacon tuning; the demo shrinks these to fail fast. */
   heartbeat?: HeartbeatOptions;
+  /** Exponential-backoff tuning for failed-task retries. */
+  backoff?: BackoffOptions;
 }
 
 interface StreamTaskPayload {
@@ -55,6 +61,7 @@ export class WorkerConsumer {
   private runner: TaskRunner;
   private readonly redisUrl: string;
   private readonly heartbeatOptions?: HeartbeatOptions;
+  private readonly backoffOptions?: BackoffOptions;
   private heartbeat: WorkerHeartbeat | null = null;
   private shutdownRequested = false;
 
@@ -64,6 +71,7 @@ export class WorkerConsumer {
     this.workerId = `worker_${process.pid}_${Date.now()}`;
     this.runner = new TaskRunner();
     this.heartbeatOptions = options?.heartbeat;
+    this.backoffOptions = options?.backoff;
   }
 
   /**
@@ -177,11 +185,16 @@ export class WorkerConsumer {
     // the publish and the ack, the entry is still pending in the PEL and can be
     // recovered. Acknowledging first would lose the task outright.
     if (attempt < maxRetries) {
+      // Park the retry in the retry ZSET with a due-time score instead of
+      // re-publishing immediately: the promoter re-dispatches it once the
+      // exponential backoff has elapsed, so a hard-failing task cannot hammer
+      // the queue. This ZADD is the publish half of publish-before-ack.
+      const delayMs = computeBackoffDelayMs(attempt, this.backoffOptions);
       console.log(
         `[worker:${this.workerId}] Task ${task.id} failed (exit=${result.exitCode}), ` +
-          `retrying attempt=${attempt + 1}/${maxRetries}`
+          `retry attempt=${attempt + 1}/${maxRetries} scheduled in ${delayMs}ms`
       );
-      await this.redispatch(task, workflowId, attempt + 1);
+      await this.scheduleRetry(task, workflowId, attempt + 1, delayMs);
     } else {
       console.log(
         `[worker:${this.workerId}] Task ${task.id} exhausted retries (${maxRetries}), routing to DLQ`
@@ -291,27 +304,28 @@ export class WorkerConsumer {
     }
   }
 
-  private async redispatch(
+  /**
+   * Park a failed task in the retry ZSET, scored by the epoch-ms at which it
+   * becomes due. The orchestrator's `RetryPromoter` moves it back onto
+   * `TASKS_STREAM` once due. The member encodes the whole payload so the
+   * promoter can re-dispatch without any other state.
+   */
+  private async scheduleRetry(
     task: TaskDefinition,
     workflowId: string,
-    nextAttempt: number
+    nextAttempt: number,
+    delayMs: number
   ): Promise<void> {
-    await this.redis.xadd(
-      TASKS_STREAM,
-      "*",
-      "workflowId",
+    const dueAt = Date.now() + delayMs;
+    const member = encodeRetryPayload({
       workflowId,
-      "taskId",
-      task.id,
-      "command",
-      task.command,
-      "timeoutMs",
-      String(task.timeout_ms),
-      "retries",
-      String(task.retries),
-      "attempt",
-      String(nextAttempt)
-    );
+      taskId: task.id,
+      command: task.command,
+      timeoutMs: task.timeout_ms,
+      retries: task.retries,
+      attempt: nextAttempt,
+    });
+    await this.redis.zadd(RETRY_ZSET, String(dueAt), member);
   }
 
   private async routeToDlq(

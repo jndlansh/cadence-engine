@@ -38,6 +38,8 @@ cadence/
     │   ├── src/runner.test.ts       # Vitest suite for task execution & failure handling
     │   ├── src/streams.ts           # Shared Redis key contract + stream-field folding
     │   ├── src/streams.test.ts      # Vitest suite for the folding helper & key names
+    │   ├── src/retry.ts             # Pure exponential-backoff math + retry payload codec
+    │   ├── src/retry.test.ts        # Vitest suite for backoff delays & payload encoding
     │   └── src/index.ts             # Core package barrel export
     ├── orchestrator/                # Coordination layer & scheduler daemon
     │   ├── src/scheduler.ts         # Redis Streams task dispatcher (XADD)
@@ -46,6 +48,8 @@ cadence/
     │   ├── src/orchestrator.test.ts # Vitest suite for the DAG walk (faked ports, no Redis)
     │   ├── src/reclaimer.ts         # Stale task reclaimer (XPENDING/XCLAIM + heartbeat gate)
     │   ├── src/reclaimer.test.ts    # Vitest suite for reclaim ordering & the DLQ cap
+    │   ├── src/promoter.ts          # Retry promoter (ZRANGEBYSCORE due -> XADD -> ZREM)
+    │   ├── src/promoter.test.ts     # Vitest suite for promotion ordering & the DLQ path
     │   ├── src/state.ts             # Global workflow run state manager   [planned — Phase 5]
     │   └── src/index.ts             # Orchestrator barrel export
     └── worker/                      # Independent task runner node
@@ -124,10 +128,10 @@ to), so it is routed to the DLQ only.
 > argued: `scripts/demo-failover.ts` SIGKILLs a real worker mid-task and asserts the workflow still
 > completes — the task is reclaimed, re-run, and the DAG advances.
 
-### Phase 4: Heartbeats, Task Reclaiming & Worker Fault Tolerance `[STATUS: IN PROGRESS]`
+### Phase 4: Heartbeats, Task Reclaiming & Worker Fault Tolerance `[STATUS: COMPLETED]`
 
-> The deadlock-closing half (heartbeat + reclaimer) is **DONE and live-verified**. The backoff
-> scheduler is the remaining item.
+> Both halves are **DONE and live-verified**: the deadlock-closing heartbeat + reclaimer, and the
+> exponential-backoff retry scheduler.
 
 - [x] **Closes the Phase 3.5 deadlock (highest priority):** reclaim tasks whose worker died so the orchestrator actually receives a completion.
 - [x] Worker Liveness Beacon: workers maintain an ephemeral key with TTL in Redis (`SET worker:<id>:heartbeat "alive" EX 10`) renewed every 3 seconds. Owns its own connection so a blocking `XREADGROUP` cannot starve it.
@@ -135,8 +139,13 @@ to), so it is routed to the DLQ only.
 - [x] Automatic Failover (`XCLAIM`): if a task is un-acked **and** its owner's heartbeat key has expired, the entry is claimed, re-published as a fresh entry (attempt + 1), then acked. Liveness-gated, not idle-only, so a slow-but-alive worker is never stolen from. `XAUTOCLAIM` was declined again.
 - [x] Reclaim exhaustion is bounded and never silent: once the retry budget is spent, the task is routed to the DLQ **and** a terminal `FAILED` completion is emitted, so the orchestrator advances instead of deadlocking on a task that can never report back.
 - [x] Shared key contract (`packages/core/src/streams.ts`): stream names, the heartbeat key and the flat-field fold live in one place — a mismatched key fails silently, which is this project's recurring bug class.
-- [x] 16 new unit tests (`pnpm test` → 59 passing: 27 core + 13 worker + 19 orchestrator).
-- [ ] Exponential backoff scheduler for failed tasks using Redis Sorted Sets (`ZSET`) — **REMAINING.**
+- [x] 16 new unit tests for the failover half (`pnpm test` → 59 passing at the time: 27 core + 13 worker + 19 orchestrator).
+- [x] Exponential backoff scheduler for failed tasks using Redis Sorted Sets (`ZSET`): the worker `ZADD`s a failed task into `cadence:retries` scored by its due time (epoch ms) instead of re-publishing immediately, then acks its entry. The orchestrator's `RetryPromoter` sweeps due members (`ZRANGEBYSCORE -inf now LIMIT`), re-`XADD`s each onto `cadence:tasks`, then `ZREM`s it — publish-before-remove, mirroring publish-before-ack.
+  - Backoff math is pure and lives in `packages/core/src/retry.ts` (`computeBackoffDelayMs`, `encodeRetryPayload`/`decodeRetryPayload`), so the delay curve and the member encoding cannot drift; the cap is applied before the exponent can overflow.
+  - The retry member encodes the whole payload, so the promoter needs no other state; each attempt is a distinct member, so re-scheduling the same attempt is an idempotent score update.
+  - Never silent: a malformed member is routed to the DLQ (`reason=RETRY_MALFORMED`) and removed; a failed promote leaves the member in place for the next sweep.
+  - The reclaimer still re-dispatches a *reclaimed* task immediately (a worker death is not a task failure) — backoff applies only to tasks that actually failed and still have retry budget.
+  - Test totals: `pnpm test` → **75 passing** (38 core + 13 worker + 24 orchestrator). Promoter wired into `scripts/smoke-phase3.ts`, `scripts/demo-orchestration.ts`, and `scripts/demo-failover.ts`.
 
 ### Phase 5: Workflow State Machine & Lifecycle Persistence `[STATUS: NOT STARTED]`
 

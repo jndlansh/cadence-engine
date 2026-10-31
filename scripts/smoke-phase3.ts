@@ -17,6 +17,7 @@
  *   XRANGE cadence:tasks:dlq - +  -> inspect payloads
  */
 import { TaskDispatcher } from "../packages/orchestrator/src/scheduler.js";
+import { RetryPromoter } from "../packages/orchestrator/src/promoter.js";
 import { WorkerConsumer } from "../packages/worker/src/consumer.js";
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -58,12 +59,18 @@ const DRAIN_MS = 12_000;
 
 async function main(): Promise<void> {
   const dispatcher = new TaskDispatcher(REDIS_URL);
-  const worker = new WorkerConsumer(REDIS_URL);
+  // A short backoff keeps the retry escalation observable within the drain
+  // window. Real deployments use the package defaults (1s base, 60s cap).
+  const worker = new WorkerConsumer(REDIS_URL, {
+    backoff: { baseDelayMs: 500, maxDelayMs: 2000 },
+  });
+  const promoter = new RetryPromoter(REDIS_URL, { pollIntervalMs: 300 });
 
   await dispatcher.ensureGroup();
   console.log(`[smoke] group ensured; worker=${worker.getWorkerId()}`);
 
   const loop = worker.start();
+  await promoter.start();
 
   for (const s of SCENARIOS) {
     console.log(`[smoke] will dispatch ${s.id} -> expect: ${s.expect}`);
@@ -87,6 +94,7 @@ async function main(): Promise<void> {
   console.log("[smoke] requesting worker shutdown");
   worker.requestShutdown();
   await loop;
+  await promoter.disconnect();
   await worker.disconnect();
   await dispatcher.disconnect();
   console.log("[smoke] done - now inspect with memurai-cli");

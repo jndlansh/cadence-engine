@@ -6,6 +6,8 @@
  *   REDIS_URL              default redis://127.0.0.1:6379
  *   HEARTBEAT_TTL_SECONDS  default 10
  *   HEARTBEAT_INTERVAL_MS  default 3000
+ *   RETRY_BASE_DELAY_MS    default 1000
+ *   RETRY_MAX_DELAY_MS     default 60000
  *
  * Prints `WORKER_READY id=<id>` once it starts, so a parent can wait for it.
  */
@@ -18,6 +20,10 @@ async function main(): Promise<void> {
     heartbeat: {
       ttlSeconds: Number(process.env.HEARTBEAT_TTL_SECONDS ?? "10"),
       intervalMs: Number(process.env.HEARTBEAT_INTERVAL_MS ?? "3000"),
+    },
+    backoff: {
+      baseDelayMs: Number(process.env.RETRY_BASE_DELAY_MS ?? "1000"),
+      maxDelayMs: Number(process.env.RETRY_MAX_DELAY_MS ?? "60000"),
     },
   });
 

@@ -22,6 +22,14 @@ export const DLQ_STREAM = "cadence:tasks:dlq";
 export const COMPLETION_STREAM = "cadence:completions";
 
 /**
+ * Sorted set of tasks awaiting a backed-off retry. Members are encoded retry
+ * payloads (`encodeRetryPayload`), scored by the epoch-ms time at which they
+ * become due. The orchestrator's `RetryPromoter` moves due members back onto
+ * `TASKS_STREAM`.
+ */
+export const RETRY_ZSET = "cadence:retries";
+
+/**
  * Default Redis endpoint. `127.0.0.1`, never `localhost`: on Windows the Redis
  * service binds IPv4 only and Node resolves `localhost` verbatim, so it can
  * dial `::1` and fail. `REDIS_URL` overrides this at the call sites.

@@ -24,6 +24,7 @@ import { TaskDispatcher } from "../packages/orchestrator/src/scheduler.js";
 import { WorkflowOrchestrator } from "../packages/orchestrator/src/orchestrator.js";
 import { RedisCompletionSource } from "../packages/orchestrator/src/completions.js";
 import { TaskReclaimer } from "../packages/orchestrator/src/reclaimer.js";
+import { RetryPromoter } from "../packages/orchestrator/src/promoter.js";
 import { WorkerConsumer } from "../packages/worker/src/consumer.js";
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -35,6 +36,10 @@ const HEARTBEAT_TTL_SECONDS = 4;
 const HEARTBEAT_INTERVAL_MS = 1000;
 const MIN_IDLE_MS = 4000;
 const COMPLETION_TIMEOUT_MS = 30_000;
+// Backoff windows are irrelevant to this demo (nothing fails after reclaim),
+// but a small base keeps any unexpected retry inside the completion timeout.
+const RETRY_BASE_DELAY_MS = 500;
+const RETRY_MAX_DELAY_MS = 2000;
 
 const REPO_ROOT = process.cwd();
 const WORKFLOW_FILE =
@@ -108,6 +113,7 @@ async function main(): Promise<void> {
     pollIntervalMs: 1000,
     minIdleMs: MIN_IDLE_MS,
   });
+  const promoter = new RetryPromoter(REDIS_URL, { pollIntervalMs: 500 });
   const orchestrator = new WorkflowOrchestrator(dispatcher, completions, {
     completionTimeoutMs: COMPLETION_TIMEOUT_MS,
   });
@@ -122,6 +128,8 @@ async function main(): Promise<void> {
         REDIS_URL,
         HEARTBEAT_TTL_SECONDS: String(HEARTBEAT_TTL_SECONDS),
         HEARTBEAT_INTERVAL_MS: String(HEARTBEAT_INTERVAL_MS),
+        RETRY_BASE_DELAY_MS: String(RETRY_BASE_DELAY_MS),
+        RETRY_MAX_DELAY_MS: String(RETRY_MAX_DELAY_MS),
       },
       stdio: ["ignore", "pipe", "pipe"],
     }
@@ -169,9 +177,14 @@ async function main(): Promise<void> {
         ttlSeconds: HEARTBEAT_TTL_SECONDS,
         intervalMs: HEARTBEAT_INTERVAL_MS,
       },
+      backoff: {
+        baseDelayMs: RETRY_BASE_DELAY_MS,
+        maxDelayMs: RETRY_MAX_DELAY_MS,
+      },
     });
     const workerBLoop = workerB.start();
     await reclaimer.start();
+    await promoter.start();
 
     const result = await runPromise;
 
@@ -187,6 +200,7 @@ async function main(): Promise<void> {
     }
 
     const stats = reclaimer.getStats();
+    const promoterStats = promoter.getStats();
     console.log(
       `\n[demo] status=${result.status} ` +
         `completed=[${result.completed.join(", ")}] ` +
@@ -194,6 +208,9 @@ async function main(): Promise<void> {
     );
     console.log(
       `[demo] reclaimer stats: reclaimed=${stats.reclaimed} DLQ=${stats.deadLettered}`
+    );
+    console.log(
+      `[demo] promoter stats: promoted=${promoterStats.promoted} dropped=${promoterStats.dropped}`
     );
 
     if (result.status !== "COMPLETED") {
@@ -225,6 +242,7 @@ async function main(): Promise<void> {
       child.kill("SIGKILL");
       await waitForExit(child);
     }
+    await promoter.disconnect();
     await completions.disconnect();
     await dispatcher.disconnect();
   }

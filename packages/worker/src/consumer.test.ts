@@ -9,13 +9,13 @@ import {
 } from "vitest";
 import { WorkerConsumer, fieldsToRecord } from "./consumer.js";
 
-const TASKS_STREAM = "cadence:tasks";
 const DLQ_STREAM = "cadence:tasks:dlq";
 const COMPLETION_STREAM = "cadence:completions";
 
 const redisMock = vi.hoisted(() => {
   const calls: string[] = [];
   const published: string[] = [];
+  const retries: Array<{ key: string; score: string; member: string }> = [];
   const labels: Record<string, string> = {
     "cadence:tasks": "XADD:tasks",
     "cadence:tasks:dlq": "XADD:dlq",
@@ -24,10 +24,16 @@ const redisMock = vi.hoisted(() => {
   return {
     calls,
     published,
+    retries,
     xadd: vi.fn(async (stream: string) => {
       calls.push(labels[stream] ?? `XADD:${stream}`);
       published.push(stream);
       return "1-0";
+    }),
+    zadd: vi.fn(async (key: string, score: string, member: string) => {
+      calls.push("ZADD");
+      retries.push({ key, score, member });
+      return 1;
     }),
     xack: vi.fn(async () => {
       calls.push("XACK");
@@ -42,6 +48,7 @@ const redisMock = vi.hoisted(() => {
 vi.mock("ioredis", () => ({
   Redis: class {
     xadd = redisMock.xadd;
+    zadd = redisMock.zadd;
     xack = redisMock.xack;
     xgroup = redisMock.xgroup;
     call = redisMock.call;
@@ -105,7 +112,9 @@ describe("WorkerConsumer.handleMessage", () => {
   beforeEach(() => {
     redisMock.calls.length = 0;
     redisMock.published.length = 0;
+    redisMock.retries.length = 0;
     redisMock.xadd.mockClear();
+    redisMock.zadd.mockClear();
     redisMock.xack.mockClear();
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
   });
@@ -131,8 +140,10 @@ describe("WorkerConsumer.handleMessage", () => {
     expect(redisMock.xadd.mock.calls[0]).toContain("COMPLETED");
   });
 
-  it("re-publishes the retry BEFORE acknowledging and emits no completion", async () => {
-    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+  it("parks a backed-off retry in the retry ZSET BEFORE acknowledging, and emits no completion", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379", {
+      backoff: { baseDelayMs: 1000 },
+    });
 
     await internals(consumer).handleMessage("2-0", {
       workflowId: "w1",
@@ -143,8 +154,26 @@ describe("WorkerConsumer.handleMessage", () => {
       attempt: "1",
     });
 
-    expect(redisMock.calls).toEqual(["XADD:tasks", "XACK"]);
-    expect(redisMock.published).toEqual([TASKS_STREAM]);
+    // Publish-before-ack: ZADD first, XACK last, nothing on the streams.
+    expect(redisMock.calls).toEqual(["ZADD", "XACK"]);
+    expect(redisMock.published).toEqual([]);
+    expect(redisMock.retries).toHaveLength(1);
+
+    const scheduled = redisMock.retries[0];
+    expect(scheduled.key).toBe("cadence:retries");
+    // Encoded payload carries the next attempt, ready for the promoter.
+    expect(JSON.parse(scheduled.member)).toEqual({
+      workflowId: "w1",
+      taskId: "flaky",
+      command: 'node -e "process.exit(3)"',
+      timeoutMs: 5000,
+      retries: 3,
+      attempt: 2,
+    });
+    // The first retry is due one base delay (1000ms) from now.
+    const delay = Number(scheduled.score) - Date.now();
+    expect(delay).toBeGreaterThan(900);
+    expect(delay).toBeLessThanOrEqual(1000);
   });
 
   it("routes to the DLQ, then the completion, then acks once retries are exhausted", async () => {
@@ -164,9 +193,9 @@ describe("WorkerConsumer.handleMessage", () => {
     expect(redisMock.xadd.mock.calls[1]).toContain("FAILED");
   });
 
-  it("never acknowledges when the follow-up publish fails (crash-window safety)", async () => {
+  it("never acknowledges when the retry scheduling fails (crash-window safety)", async () => {
     const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
-    redisMock.xadd.mockRejectedValueOnce(new Error("redis down"));
+    redisMock.zadd.mockRejectedValueOnce(new Error("redis down"));
 
     await expect(
       internals(consumer).handleMessage("4-0", {

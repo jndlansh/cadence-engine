@@ -240,8 +240,8 @@ tasks:
 
 - [x] **Phase 1: Core Domain Engine** — Zod schema boundaries, Kahn's algorithm cycle detection, dynamic unblocking, and YAML deserialization.
 - [x] **Phase 2: Execution Subsystem** — Subprocess runner, cross-platform shell standardizations, hard timeout guards, and stdio buffering.
-- [ ] **Phase 3: Redis Distributed Queue** — Redis Streams dispatcher, dynamic worker consumer groups, and atomic acknowledgment contracts.
-- [ ] **Phase 4: Fault Recovery & Reclaim Loops** — Pending Entries List (PEL) monitoring, worker TTL heartbeats, and autonomous `XCLAIM` failovers.
+- [x] **Phase 3: Redis Distributed Queue** — Redis Streams dispatcher, dynamic worker consumer groups, and atomic acknowledgment contracts.
+- [x] **Phase 4: Fault Recovery & Reclaim Loops** — Pending Entries List (PEL) monitoring, worker TTL heartbeats, autonomous `XCLAIM` failovers, and exponential-backoff retry scheduling via Redis sorted sets.
 - [ ] **Phase 5: Workflow State & Event Telemetry** — Pipeline state transitions, execution history persistence, and structured run telemetry.
 - [ ] **Phase 6: Orchestrator CLI** — Unified terminal interface to trigger workflows, inspect queues, and observe live cluster progress.
 

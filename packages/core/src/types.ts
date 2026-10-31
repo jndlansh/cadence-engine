@@ -77,3 +77,19 @@ export const TaskCompletionSchema = z.object({
 });
 
 export type TaskCompletion = z.infer<typeof TaskCompletionSchema>;
+
+/**
+ * A task waiting for a backed-off retry, stored as a member of the
+ * `RETRY_ZSET` sorted set. Kept in core so the worker (producer) and the
+ * orchestrator's promoter (consumer) cannot silently disagree on the shape.
+ */
+export const RetryPayloadSchema = z.object({
+  workflowId: z.string().min(1),
+  taskId: z.string().min(1),
+  command: z.string().min(1),
+  timeoutMs: z.coerce.number().int().positive(),
+  retries: z.coerce.number().int().nonnegative(),
+  attempt: z.coerce.number().int().positive(),
+});
+
+export type RetryPayload = z.infer<typeof RetryPayloadSchema>;
