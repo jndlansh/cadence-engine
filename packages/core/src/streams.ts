@@ -51,6 +51,14 @@ export function heartbeatKey(workerId: string): string {
 }
 
 /**
+ * Persistence key for a workflow's lifecycle snapshot (a Redis hash). Shared so
+ * the orchestrator's store and any future reader (Phase 6 CLI) agree on it.
+ */
+export function workflowStateKey(workflowId: string): string {
+  return `workflow:${workflowId}:state`;
+}
+
+/**
  * Redis returns stream entry fields as a flat `[field, value, field, value]`
  * array — never an object — so indexing by key yields `undefined`. Fold the
  * pairs into a lookup record first. A dangling trailing field (no value) is

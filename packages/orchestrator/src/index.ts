@@ -21,3 +21,13 @@ export {
   type PromoteResult,
   type RetryPromoterOptions,
 } from "./promoter.js";
+export {
+  RedisWorkflowStateStore,
+  type WorkflowStateStore,
+} from "./state-store.js";
+export {
+  WorkflowEventLogger,
+  type WorkflowEvent,
+  type WorkflowEventSink,
+  type WorkflowEventLoggerOptions,
+} from "./event-logger.js";

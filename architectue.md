@@ -22,6 +22,7 @@ cadence/
 │   ├── smoke-phase3.ts             # Live Redis dispatch + consume smoke test (Phase 3)
 │   ├── demo-orchestration.ts       # Live DAG run; asserts the topological invariant (Phase 3.5)
 │   ├── demo-failover.ts            # Live worker-kill → reclaim → recovery proof (Phase 4)
+│   ├── demo-state.ts               # Live persisted lifecycle proof: COMPLETED + FAILED (Phase 5)
 │   └── worker-node.ts              # Standalone worker process (fresh child the demo SIGKILLs)
 ├── workflows/                       # Workflow YAML manifests
 │   ├── demo-pipeline.yaml          # 3-wave diamond used by the Phase 3.5 demo
@@ -40,6 +41,8 @@ cadence/
     │   ├── src/streams.test.ts      # Vitest suite for the folding helper & key names
     │   ├── src/retry.ts             # Pure exponential-backoff math + retry payload codec
     │   ├── src/retry.test.ts        # Vitest suite for backoff delays & payload encoding
+    │   ├── src/state.ts             # Pure workflow lifecycle state machine (reducer)
+    │   ├── src/state.test.ts        # Vitest suite for lifecycle transitions
     │   └── src/index.ts             # Core package barrel export
     ├── orchestrator/                # Coordination layer & scheduler daemon
     │   ├── src/scheduler.ts         # Redis Streams task dispatcher (XADD)
@@ -50,7 +53,10 @@ cadence/
     │   ├── src/reclaimer.test.ts    # Vitest suite for reclaim ordering & the DLQ cap
     │   ├── src/promoter.ts          # Retry promoter (ZRANGEBYSCORE due -> XADD -> ZREM)
     │   ├── src/promoter.test.ts     # Vitest suite for promotion ordering & the DLQ path
-    │   ├── src/state.ts             # Global workflow run state manager   [planned — Phase 5]
+    │   ├── src/state-store.ts       # RedisWorkflowStateStore: persists the lifecycle snapshot
+    │   ├── src/state-store.test.ts  # Vitest suite for save/load round-trip & malformed state
+    │   ├── src/event-logger.ts      # WorkflowEventLogger: console + JSON-lines telemetry
+    │   ├── src/event-logger.test.ts # Vitest suite for the structured event log
     │   └── src/index.ts             # Orchestrator barrel export
     └── worker/                      # Independent task runner node
         ├── src/consumer.ts          # Redis Streams consumer loop (XREADGROUP) + completion publishing
@@ -147,11 +153,19 @@ to), so it is routed to the DLQ only.
   - The reclaimer still re-dispatches a *reclaimed* task immediately (a worker death is not a task failure) — backoff applies only to tasks that actually failed and still have retry budget.
   - Test totals: `pnpm test` → **75 passing** (38 core + 13 worker + 24 orchestrator). Promoter wired into `scripts/smoke-phase3.ts`, `scripts/demo-orchestration.ts`, and `scripts/demo-failover.ts`.
 
-### Phase 5: Workflow State Machine & Lifecycle Persistence `[STATUS: NOT STARTED]`
+### Phase 5: Workflow State Machine & Lifecycle Persistence `[STATUS: COMPLETED]`
 
-- [ ] Workflow lifecycle state management: `PENDING` $\to$ `RUNNING` $\to$ `COMPLETED` | `FAILED`.
-- [ ] Tracking task execution attempts, execution latency, and error states.
-- [ ] Structured file/console event logger.
+- [x] Workflow lifecycle state management: `PENDING` $\to$ `RUNNING` $\to$ `COMPLETED` | `FAILED` | `STALLED` (the terminal `STALLED` mirrors the orchestrator's stall guard).
+- [x] Pure reducer (`packages/core/src/state.ts`): `initialWorkflowState`, `reduceWorkflowState`, `isTerminalWorkflowState`. No I/O, so the lifecycle rules are deterministic and unit-testable in isolation; transitions are monotonic and idempotent (a duplicate completion or any event after a terminal state is ignored).
+- [x] Task execution tracking: a per-task record carrying status, attempt, `dispatchedAt`, `completedAt`, execution `durationMs`, end-to-end `latencyMs` (dispatch $\to$ completion, including queue wait), `exitCode`, `timedOut` and `error`.
+- [x] Persistence (`orchestrator/src/state-store.ts`): `RedisWorkflowStateStore` writes each snapshot to the Redis hash `workflow:<id>:state` (`workflowStateKey()` in `core/src/streams.ts`). It survives an orchestrator restart, `HSET` overwrites atomically, and it is inspectable with `HGETALL` / `HGET ... tasks`. A malformed or invalid persisted hash is logged and returns `null` — never silently.
+- [x] Structured event logger (`orchestrator/src/event-logger.ts`): `WorkflowEventLogger` emits a compact console line plus an optional JSON-lines file. It is injected through a `WorkflowEventSink` port, so the DAG walk stays testable with a fake.
+- [x] The completion payload now carries optional **`timedOut`** and **`error`** fields, so failure states record real detail instead of inferring from `exitCode`. `timedOut` is decoded explicitly from the stream string — **not** via `z.coerce.boolean()`, which would read `"false"` as `true`.
+- [x] Persistence is **best-effort**: a `stateStore` write failure is logged and the run continues. Telemetry must never be able to deadlock orchestration.
+- [x] Live verification: `pnpm exec tsx scripts/demo-state.ts` — run 1 (the diamond) ends `COMPLETED` and the snapshot is read back from Redis and asserted (attempt/latency present for every task); run 2 (a failing pipeline) ends `FAILED`, with `never` never dispatched and the persisted `failed` list naming `boom`. The script exits non-zero on any violation.
+- [x] 29 new unit tests (core `state` 10, core `streams` +1, orchestrator `state-store` 6, `event-logger` 4, `orchestrator` +7, worker `consumer` +1); `pnpm test` → **104 passing** (48 core + 14 worker + 42 orchestrator).
+
+**Decision (was open, now closed):** state is persisted in a Redis hash per workflow, not in-memory only — consistent with the at-least-once / crash-survival posture of the rest of the engine.
 
 ### Phase 6: Orchestrator CLI & Workflow Submission `[STATUS: NOT STARTED]`
 

@@ -12,6 +12,7 @@ import {
   type ParsedWorkflow,
   type TaskCompletion,
   type TaskDefinition,
+  type WorkflowStateSnapshot,
 } from "@cadence/core";
 import {
   WorkflowOrchestrator,
@@ -19,6 +20,8 @@ import {
   type TaskSink,
 } from "./orchestrator.js";
 import { parseCompletionEntry } from "./completions.js";
+import type { WorkflowStateStore } from "./state-store.js";
+import type { WorkflowEvent, WorkflowEventSink } from "./event-logger.js";
 
 const WF = "wf_test";
 
@@ -45,6 +48,35 @@ class FakeSource implements CompletionSource {
     const next = this.queue.shift();
     return next ? [next] : null;
   }
+}
+
+class FakeStateStore implements WorkflowStateStore {
+  readonly saves: WorkflowStateSnapshot[] = [];
+  failNext = false;
+
+  async save(snapshot: WorkflowStateSnapshot): Promise<void> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("state store down");
+    }
+    this.saves.push(snapshot);
+  }
+
+  async load(): Promise<WorkflowStateSnapshot | null> {
+    return this.saves.length > 0 ? this.saves[this.saves.length - 1] : null;
+  }
+
+  async disconnect(): Promise<void> {}
+}
+
+class FakeLogger implements WorkflowEventSink {
+  readonly events: WorkflowEvent[] = [];
+
+  async emit(event: WorkflowEvent): Promise<void> {
+    this.events.push(event);
+  }
+
+  async close(): Promise<void> {}
 }
 
 function completion(
@@ -105,6 +137,14 @@ tasks:
     command: echo root_a
   - id: root_b
     command: echo root_b
+`;
+
+const SINGLE = `
+version: "1.0"
+workflow: single
+tasks:
+  - id: only
+    command: echo only
 `;
 
 describe("WorkflowOrchestrator", () => {
@@ -279,6 +319,90 @@ describe("WorkflowOrchestrator", () => {
     expect(sink.waves).toEqual([["a"]]);
     expect(result.completed).toEqual([]);
   });
+
+  it("persists lifecycle transitions and per-task records to the state store", async () => {
+    const sink = new FakeSink();
+    const source = new FakeSource();
+    source.push(completion("a"), completion("b"), completion("c"));
+    const store = new FakeStateStore();
+
+    const result = await new WorkflowOrchestrator(sink, source, {
+      stateStore: store,
+    }).run(WF, workflow(LINEAR));
+
+    expect(result.status).toBe("COMPLETED");
+    expect(result.state.state).toBe("COMPLETED");
+    // First persist is the RUNNING transition, last is the terminal one.
+    expect(store.saves[0].state).toBe("RUNNING");
+    expect(store.saves[store.saves.length - 1].state).toBe("COMPLETED");
+    expect(store.saves[store.saves.length - 1].tasks["c"]).toMatchObject({
+      status: "COMPLETED",
+      attempt: 1,
+    });
+  });
+
+  it("persists a terminal FAILED state with the failed task", async () => {
+    const sink = new FakeSink();
+    const source = new FakeSource();
+    source.push(completion("a", "FAILED"));
+    const store = new FakeStateStore();
+
+    const result = await new WorkflowOrchestrator(sink, source, {
+      stateStore: store,
+    }).run(WF, workflow(LINEAR));
+
+    expect(result.status).toBe("FAILED");
+    const final = store.saves[store.saves.length - 1];
+    expect(final.state).toBe("FAILED");
+    expect(final.failed).toEqual(["a"]);
+    expect(final.tasks["a"].status).toBe("FAILED");
+    expect(final.completedAt).toBeDefined();
+  });
+
+  it("persists STALLED when no completion ever arrives", async () => {
+    const store = new FakeStateStore();
+
+    const result = await new WorkflowOrchestrator(new FakeSink(), new FakeSource(), {
+      completionTimeoutMs: 0,
+      stateStore: store,
+    }).run(WF, workflow(LINEAR));
+
+    expect(result.status).toBe("STALLED");
+    expect(store.saves[store.saves.length - 1].state).toBe("STALLED");
+  });
+
+  it("keeps orchestrating when the state store fails to persist", async () => {
+    const sink = new FakeSink();
+    const source = new FakeSource();
+    source.push(completion("a"), completion("b"), completion("c"));
+    const store = new FakeStateStore();
+    store.failNext = true; // the WORKFLOW_STARTED save fails
+
+    const result = await new WorkflowOrchestrator(sink, source, {
+      stateStore: store,
+    }).run(WF, workflow(LINEAR));
+
+    expect(result.status).toBe("COMPLETED");
+    expect(errorSpy).toHaveBeenCalled();
+  });
+
+  it("emits structured lifecycle events to the logger", async () => {
+    const sink = new FakeSink();
+    const source = new FakeSource();
+    source.push(completion("only"));
+    const logger = new FakeLogger();
+
+    const result = await new WorkflowOrchestrator(sink, source, {
+      logger,
+    }).run(WF, workflow(SINGLE));
+
+    const types = logger.events.map((event) => event.type);
+    expect(types).toContain("WORKFLOW_STARTED");
+    expect(types).toContain("TASK_DISPATCHED");
+    expect(types).toContain("TASK_COMPLETED");
+    expect(types[types.length - 1]).toBe("WORKFLOW_FINISHED");
+    expect(result.status).toBe("COMPLETED");
+  });
 });
 
 describe("parseCompletionEntry", () => {
@@ -340,5 +464,49 @@ describe("parseCompletionEntry", () => {
         "1",
       ])
     ).toBeNull();
+  });
+
+  it("decodes timedOut=false as false, not by string truthiness", () => {
+    const parsed = parseCompletionEntry([
+      "workflowId",
+      "w1",
+      "taskId",
+      "t1",
+      "status",
+      "FAILED",
+      "attempt",
+      "1",
+      "exitCode",
+      "1",
+      "durationMs",
+      "5",
+      "timedOut",
+      "false",
+      "error",
+      "boom",
+    ]);
+
+    expect(parsed).toMatchObject({ timedOut: false, error: "boom" });
+  });
+
+  it("decodes timedOut=true as true", () => {
+    const parsed = parseCompletionEntry([
+      "workflowId",
+      "w1",
+      "taskId",
+      "t1",
+      "status",
+      "FAILED",
+      "attempt",
+      "1",
+      "exitCode",
+      "124",
+      "durationMs",
+      "1000",
+      "timedOut",
+      "true",
+    ]);
+
+    expect(parsed?.timedOut).toBe(true);
   });
 });

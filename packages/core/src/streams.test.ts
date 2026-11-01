@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { foldStreamFields, heartbeatKey } from "./streams.js";
+import { foldStreamFields, heartbeatKey, workflowStateKey } from "./streams.js";
 
 describe("foldStreamFields", () => {
   it("folds a flat field/value array into a lookup record", () => {
@@ -28,5 +28,11 @@ describe("heartbeatKey", () => {
     expect(heartbeatKey("worker_123_456")).toBe(
       "worker:worker_123_456:heartbeat"
     );
+  });
+});
+
+describe("workflowStateKey", () => {
+  it("namespaces the state key under the workflow id", () => {
+    expect(workflowStateKey("demo_wf_1")).toBe("workflow:demo_wf_1:state");
   });
 });

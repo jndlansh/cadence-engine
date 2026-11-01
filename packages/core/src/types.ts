@@ -18,12 +18,15 @@ export const WorkflowSchema = z.object({
 export type TaskDefinition = z.infer<typeof TaskSchema>;
 export type WorkflowDefinition = z.infer<typeof WorkflowSchema>;
 
-export type TaskExecutionStatus =
-  | "PENDING"
-  | "READY"
-  | "RUNNING"
-  | "COMPLETED"
-  | "FAILED";
+export const TaskExecutionStatusSchema = z.enum([
+  "PENDING",
+  "READY",
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+]);
+
+export type TaskExecutionStatus = z.infer<typeof TaskExecutionStatusSchema>;
 
 /**
  * Result of a single task execution attempt.
@@ -60,6 +63,18 @@ export interface TaskRunnerOptions {
 }
 
 /**
+ * Decode a boolean that arrives as a stream string.
+ *
+ * Deliberately NOT `z.coerce.boolean()`: `Boolean("false")` is `true`, so a
+ * worker writing `timedOut=false` would be read back as timed-out. Only the
+ * exact strings `"true"` / `"false"` are accepted, and absent means `undefined`.
+ */
+const streamBoolean = z
+  .enum(["true", "false"])
+  .transform((v) => v === "true")
+  .optional();
+
+/**
  * Terminal outcome of a task, published by the worker to the completions stream
  * so the orchestrator can advance the DAG.
  *
@@ -74,6 +89,10 @@ export const TaskCompletionSchema = z.object({
   attempt: z.coerce.number().int().positive(),
   exitCode: z.coerce.number().int(),
   durationMs: z.coerce.number().int().nonnegative(),
+  /** True when the timeout guard killed the process. Absent on older entries. */
+  timedOut: streamBoolean,
+  /** Failure detail (spawn error or captured stderr). Absent on success. */
+  error: z.string().optional(),
 });
 
 export type TaskCompletion = z.infer<typeof TaskCompletionSchema>;
@@ -93,3 +112,63 @@ export const RetryPayloadSchema = z.object({
 });
 
 export type RetryPayload = z.infer<typeof RetryPayloadSchema>;
+
+/**
+ * Lifecycle of a whole workflow run. `STALLED` mirrors the orchestrator's stall
+ * guard: no completion arrived within the timeout, which (before Phase 4) meant
+ * a dead worker and now means something is badly wrong.
+ */
+export const WorkflowLifecycleStateSchema = z.enum([
+  "PENDING",
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+  "STALLED",
+]);
+
+export type WorkflowLifecycleState = z.infer<
+  typeof WorkflowLifecycleStateSchema
+>;
+
+/** Terminal workflow states — once reached, no further transition applies. */
+export type TerminalWorkflowStatus = "COMPLETED" | "FAILED" | "STALLED";
+
+/**
+ * Per-task record inside a workflow state snapshot: the last known status, the
+ * attempt, and timing/outcome detail. Numeric/optional fields default sensibly
+ * for a task that has not been dispatched yet.
+ */
+export const TaskRunRecordSchema = z.object({
+  taskId: z.string().min(1),
+  status: TaskExecutionStatusSchema,
+  attempt: z.number().int().nonnegative(),
+  dispatchedAt: z.number().int().nonnegative(),
+  completedAt: z.number().int().nonnegative().optional(),
+  /** Execution time reported by the worker's completion. */
+  durationMs: z.number().int().nonnegative().optional(),
+  /** Dispatch-to-completion wall time, including queue wait. */
+  latencyMs: z.number().int().nonnegative().optional(),
+  exitCode: z.number().int().optional(),
+  timedOut: z.boolean().optional(),
+  error: z.string().optional(),
+});
+
+export type TaskRunRecord = z.infer<typeof TaskRunRecordSchema>;
+
+/**
+ * Persisted snapshot of a workflow run. Held as a Redis hash
+ * (`workflow:<id>:state`) so it is durable and inspectable with `HGETALL`.
+ * Timestamps use `z.coerce` because values read back from a Redis hash are
+ * strings, while in-memory snapshots hold real numbers.
+ */
+export const WorkflowStateSnapshotSchema = z.object({
+  workflowId: z.string().min(1),
+  state: WorkflowLifecycleStateSchema,
+  startedAt: z.coerce.number().int().nonnegative(),
+  updatedAt: z.coerce.number().int().nonnegative(),
+  completedAt: z.coerce.number().int().nonnegative().optional(),
+  failed: z.array(z.string()),
+  tasks: z.record(z.string(), TaskRunRecordSchema),
+});
+
+export type WorkflowStateSnapshot = z.infer<typeof WorkflowStateSnapshotSchema>;

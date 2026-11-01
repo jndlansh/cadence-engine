@@ -4,3 +4,4 @@ export * from "./parser.js";
 export * from "./runner.js";
 export * from "./streams.js";
 export * from "./retry.js";
+export * from "./state.js";

@@ -225,4 +225,26 @@ describe("WorkerConsumer.handleMessage", () => {
 
     errorSpy.mockRestore();
   });
+
+  it("includes timedOut and error detail on a failed completion", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("6-0", {
+      workflowId: "w1",
+      taskId: "boom",
+      command: 'node -e "process.exit(1)"',
+      timeoutMs: "5000",
+      retries: "0",
+      attempt: "1",
+    });
+
+    const completionCall =
+      redisMock.xadd.mock.calls.find(
+        (call) => call[0] === COMPLETION_STREAM
+      ) ?? [];
+    expect(completionCall).toContain("FAILED");
+    expect(completionCall).toContain("timedOut");
+    expect(completionCall).toContain("false");
+    expect(completionCall).toContain("error");
+  });
 });

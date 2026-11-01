@@ -293,7 +293,15 @@ export class WorkerConsumer {
       "exitCode",
       String(result.exitCode),
       "durationMs",
-      String(result.durationMs)
+      String(result.durationMs),
+      "timedOut",
+      String(result.timedOut),
+      "error",
+      result.error
+        ? result.error.message
+        : result.status === "FAILED"
+          ? result.stderr
+          : ""
     );
   }
 
