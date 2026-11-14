@@ -1,0 +1,19 @@
+{
+  "name": "@cadence/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@cadence/core": "workspace:*",
+    "@cadence/orchestrator": "workspace:*",
+    "@cadence/worker": "workspace:*",
+    "cli-progress": "^3.12.0",
+    "commander": "^15.0.0"
+  },
+  "devDependencies": {
+    "@types/cli-progress": "^3.11.6"
+  }
+}

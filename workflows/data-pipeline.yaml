@@ -1,0 +1,38 @@
+version: "1.0"
+workflow: data_pipeline
+tasks:
+  - id: extract
+    command: 'node -e "console.log(\"extracting raw events\")"'
+    timeout_ms: 10000
+
+  - id: validate
+    command: 'node -e "console.log(\"validating schema\")"'
+    depends_on:
+      - extract
+    timeout_ms: 10000
+
+  - id: enrich
+    command: 'node -e "console.log(\"enriching records\")"'
+    depends_on:
+      - extract
+    timeout_ms: 15000
+
+  - id: aggregate
+    command: 'node -e "console.log(\"aggregating metrics\")"'
+    depends_on:
+      - validate
+      - enrich
+    timeout_ms: 15000
+    retries: 2
+
+  - id: report
+    command: 'node -e "console.log(\"writing report\")"'
+    depends_on:
+      - aggregate
+    timeout_ms: 10000
+
+  - id: notify
+    command: 'node -e "console.log(\"notifying downstream\")"'
+    depends_on:
+      - aggregate
+    timeout_ms: 10000

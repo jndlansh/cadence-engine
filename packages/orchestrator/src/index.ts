@@ -31,3 +31,4 @@ export {
   type WorkflowEventSink,
   type WorkflowEventLoggerOptions,
 } from "./event-logger.js";
+export { pingRedis } from "./connectivity.js";

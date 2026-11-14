@@ -27,7 +27,7 @@ cadence/
 ├── workflows/                       # Workflow YAML manifests
 │   ├── demo-pipeline.yaml          # 3-wave diamond used by the Phase 3.5 demo
 │   ├── failover-pipeline.yaml      # Long-task → dependent, used by the Phase 4 failover demo
-│   └── data-pipeline.yaml          # Sample multi-stage DAG workflow   [planned — Phase 6]
+│   └── data-pipeline.yaml          # Multi-stage DAG used by the Phase 6 CLI demo
 └── packages/
     ├── core/                        # Pure domain engine, schemas & process execution
     │   ├── src/types.ts             # Zod contracts & shared interfaces
@@ -58,12 +58,20 @@ cadence/
     │   ├── src/event-logger.ts      # WorkflowEventLogger: console + JSON-lines telemetry
     │   ├── src/event-logger.test.ts # Vitest suite for the structured event log
     │   └── src/index.ts             # Orchestrator barrel export
-    └── worker/                      # Independent task runner node
-        ├── src/consumer.ts          # Redis Streams consumer loop (XREADGROUP) + completion publishing
-        ├── src/consumer.test.ts     # Vitest suite for stream parsing & ack ordering
-        ├── src/heartbeat.ts         # Periodic liveness beacon (worker:<id>:heartbeat TTL key)
-        ├── src/heartbeat.test.ts    # Vitest suite for beat cadence, TTL & failure tolerance
-        └── src/index.ts             # Worker barrel export
+    ├── worker/                      # Independent task runner node
+    │   ├── src/consumer.ts          # Redis Streams consumer loop (XREADGROUP) + completion publishing
+    │   ├── src/consumer.test.ts     # Vitest suite for stream parsing & ack ordering
+    │   ├── src/heartbeat.ts         # Periodic liveness beacon (worker:<id>:heartbeat TTL key)
+    │   ├── src/heartbeat.test.ts    # Vitest suite for beat cadence, TTL & failure tolerance
+    │   └── src/index.ts             # Worker barrel export
+    └── cli/                         # Orchestrator CLI (Phase 6)
+        ├── src/main.ts              # Entry: exit-code mapping, SIGINT handling
+        ├── src/program.ts           # commander program; run/status subcommands
+        ├── src/progress.ts          # buildProgressView + ProgressStateStore decorator + reporters
+        ├── src/workers.ts           # Spawns N local worker children, waits for WORKER_READY
+        ├── src/commands/run.ts      # `run <file>`: dispatch, workers, orchestrate, render
+        ├── src/commands/status.ts   # `status <id>`: print the persisted lifecycle snapshot
+        └── src/index.ts             # CLI barrel export
 ```
 
 ---
@@ -167,11 +175,20 @@ to), so it is routed to the DLQ only.
 
 **Decision (was open, now closed):** state is persisted in a Redis hash per workflow, not in-memory only — consistent with the at-least-once / crash-survival posture of the rest of the engine.
 
-### Phase 6: Orchestrator CLI & Workflow Submission `[STATUS: NOT STARTED]`
+### Phase 6: Orchestrator CLI & Workflow Submission `[STATUS: COMPLETED]`
 
-- [ ] CLI runner to trigger workflows: `pnpm cadence run ./workflows/data-pipeline.yaml`.
-- [ ] Live terminal progress bar rendering active, completed, and failed tasks in real-time.
-- [ ] Multi-worker launch script using Docker or local concurrent processes for demo purposes.
+- [x] CLI runner: `pnpm cadence run ./workflows/data-pipeline.yaml` (root `cadence` script → `tsx packages/cli/src/main.ts`). Built with **commander**; `run` and `status` subcommands.
+- [x] Live progress bar (via **cli-progress**): a `ProgressStateStore` decorator over the Redis state store repaints on every lifecycle save, so progress reflects the persisted truth. Plain one-line output when not a TTY or with `--no-progress`; the orchestrator's own console output is bridged above the bar so it cannot tear it.
+- [x] `run` **spawns N local worker children** (`--workers N`) via `scripts/worker-node.ts`, waits for `WORKER_READY`, and stops them on completion (Docker Compose remains the container path).
+- [x] `status <workflow-id>` prints the persisted snapshot (state, timestamps, per-task attempt/latency/exit/error) — the Phase 5 hash's first consumer.
+- [x] Exit codes: **0** COMPLETED, **1** FAILED / runtime error, **2** usage / parse error, **3** STALLED, **4** environment (Redis unreachable).
+- [x] **Redis preflight**: both commands `ping` Redis before creating any client, worker, or stream, so an unreachable server produces one actionable message ("cannot connect to Redis at …; start Memurai or pass --redis-url") and exit 4, instead of an ioredis retry storm. `pingRedis` lives in `orchestrator/src/connectivity.ts`. Subcommands also inherit commander's `exitOverride`, so a bad invocation exits 2 rather than 1.
+- [x] `workflows/data-pipeline.yaml` created (6-task multi-stage DAG).
+- [x] **Additive**: no changes to `core` or `worker`; the CLI reuses the Phase 5 `WorkflowStateStore` port and a store decorator. The only orchestrator change is a new `connectivity.ts` (`pingRedis`) exported from its barrel.
+- [x] 19 new unit tests (CLI `program` 5, `progress` 4, `workers` 4, `status` 3, `redis-check` 3); `pnpm test` → **123 passing** (48 core + 14 worker + 42 orchestrator + 19 CLI).
+
+**Live (verified 2026-11-01 via a throwaway `memurai.exe` on 127.0.0.1:6379, stopped afterwards):**
+`pnpm cadence run workflows/data-pipeline.yaml --workers 2` → live progress through the 6-task DAG → `COMPLETED`, exit 0. `pnpm cadence status <id>` prints the persisted table. A failing workflow exits 1 (fail-fast held: the child never ran); a missing id exits 1; an unknown command exits 2; **with Redis stopped, `run`/`status` print one actionable message and exit 4** (no ioredis retry storm), and a missing `status` argument exits 2.
 
 ---
 
