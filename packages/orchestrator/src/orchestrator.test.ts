@@ -41,32 +41,61 @@ class FakeSink implements TaskSink {
   }
 }
 
+/**
+ * A small in-memory stream: entries are ordered, each `read` yields the next one
+ * after the current position, and `headCursor` reports where the stream ended
+ * when the run began. That is enough to model the difference between a
+ * completion that predates the run and one the run itself produces.
+ */
 class FakeSource implements CompletionSource {
-  private readonly queue: TaskCompletion[] = [];
-  private position = "0";
-  private reads = 0;
-  /** Every cursor a resume asked to replay from. */
+  private readonly entries: Array<{ id: number; completion: TaskCompletion }> =
+    [];
+  private position = 0;
+  private newestId = 0;
+  /** Newest entry id present *before* the run started. */
+  private head = 0;
+  /** Every cursor a run asked to read from. */
   readonly seeks: string[] = [];
 
+  /** A completion already in the stream before the run starts. */
+  pushHistory(...completions: TaskCompletion[]): void {
+    for (const completion of completions) {
+      this.entries.push({ id: this.nextId(), completion });
+    }
+    this.head = this.newestId;
+  }
+
+  /** A completion the run itself produces while it is going. */
   push(...completions: TaskCompletion[]): void {
-    this.queue.push(...completions);
+    for (const completion of completions) {
+      this.entries.push({ id: this.nextId(), completion });
+    }
+  }
+
+  private nextId(): number {
+    this.newestId += 1;
+    return this.newestId;
   }
 
   async read(): Promise<TaskCompletion[] | null> {
-    const next = this.queue.shift();
+    const next = this.entries.find((entry) => entry.id > this.position);
     if (!next) return null;
-    this.reads += 1;
-    this.position = `entry-${this.reads}`;
-    return [next];
+    this.position = next.id;
+    return [next.completion];
   }
 
   cursor(): string {
-    return this.position;
+    return String(this.position);
+  }
+
+  async headCursor(): Promise<string> {
+    return String(this.head);
   }
 
   seek(cursor: string): void {
     this.seeks.push(cursor);
-    this.position = cursor;
+    const parsed = Number(cursor);
+    if (Number.isFinite(parsed)) this.position = parsed;
   }
 }
 
@@ -463,6 +492,62 @@ describe("WorkflowOrchestrator", () => {
     expect(types).toContain("TASK_COMPLETED");
     expect(types[types.length - 1]).toBe("WORKFLOW_FINISHED");
     expect(result.status).toBe("COMPLETED");
+  });
+
+  describe("fresh-run cursor", () => {
+    it("ignores completions that predate the run (a reused workflow id)", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      // Leftovers from an earlier run under this id — a terminal failure.
+      source.pushHistory(
+        completion("root_a", "FAILED"),
+        completion("root_b", "FAILED")
+      );
+      // What this run actually produces.
+      source.push(completion("root_a"), completion("root_b"));
+
+      const result = await new WorkflowOrchestrator(sink, source).run(
+        WF,
+        workflow(TWO_ROOTS)
+      );
+
+      expect(source.seeks).toEqual(["2"]);
+      expect(result.status).toBe("COMPLETED");
+      expect(result.failed).toEqual([]);
+    });
+
+    it("does not replay a finished run's completions when starting over", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.pushHistory(completion("only", "FAILED"));
+      source.push(completion("only"));
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun([{ id: "only", status: "COMPLETED" }], {
+          state: "COMPLETED",
+        })
+      );
+
+      const result = await new WorkflowOrchestrator(sink, source, {
+        stateStore: store,
+      }).run(WF, workflow(SINGLE));
+
+      expect(result.resumed).toBe(false);
+      expect(result.status).toBe("COMPLETED");
+      expect(result.failed).toEqual([]);
+      expect(sink.waves).toEqual([["only"]]);
+      expect(warnSpy).toHaveBeenCalled();
+    });
+
+    it("starts at the head even when the stream is empty", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("only"));
+
+      await new WorkflowOrchestrator(sink, source).run(WF, workflow(SINGLE));
+
+      expect(source.seeks).toEqual(["0"]);
+    });
   });
 
   describe("resume", () => {

@@ -278,9 +278,37 @@ with `Cannot read properties of undefined (reading 'position')`. Neither `tsc` n
 see it — both are legal in that argument position, and `RedisCompletionSource` isn't unit-tested (the
 orchestrator tests inject a fake). Only the live run caught it. The field is now `cursorPosition`.
 
-**Still open (deliberate):** a *fresh* run that **reuses an explicit id** still starts its completions read
-at `0`, so it can replay that id's old completions. The CLI's unique-id default avoids it and `--resume`
-now covers "continue this id" properly, but cursor-at-head for fresh runs is the right fix — item 1 below.
+**Resolved 2026-11-16 (see the section below):** the hazard noted here — a *fresh* run that reuses an
+explicit id reading its completions from `0` and replaying that id's old outcomes — is fixed by starting a
+fresh run at the stream head.
+
+### Fresh-Run Completions Cursor (step 1, item 4) `[STATUS: COMPLETED]`
+
+> A fresh run used to read the completions stream from position `0`. If that workflow id had been used
+> before, the stream still held the **earlier run's** outcomes — and they were applied to the new run.
+
+- [x] **`CompletionSource.headCursor()`** — the position of the newest entry currently in the stream
+  (`"0"` when empty), read with `XREVRANGE … COUNT 1`. (`XREVRANGE`, not `XINFO STREAM`: a missing key is
+  an empty reply rather than an error.)
+- [x] **A fresh run seeks to the head before dispatching anything**, so it can only ever observe
+  completions published after it started. Resume is unchanged — it seeks to the persisted cursor instead.
+- [x] **Why it mattered (both symptoms are silent wrongness** — the result would not describe the work the
+  run actually did): a stale `FAILED` made a fresh run **abort before doing any work** (fail-fast on a
+  completion for a task that had not run), and a stale `COMPLETED` made it **advance — or report success —
+  without executing the task**.
+- [x] **Side benefit:** a fresh run no longer re-scans every other workflow's completions on each read.
+- [x] 3 new unit tests; the two that matter were confirmed to **fail** pre-fix (`expected [ '0' ] to deeply
+  equal [ '2' ]` and `expected 'FAILED' to be 'COMPLETED'`). `pnpm test` → **155 passing**.
+- [x] **Live-verified (2026-11-16, throwaway `memurai.exe`, stopped afterwards):** with a stale `FAILED`
+  seeded for `stale_wf_1`/`extract`, a fresh `--workflow-id stale_wf_1` logged
+  `fresh run: ignoring completions at or before 1794829204006-0`, executed all six tasks and reported
+  `COMPLETED` — and the stale entry was still in the stream afterwards (XLEN 7 = 1 stale + 6 real),
+  proving it was skipped rather than consumed.
+
+**Known trap this exposes (open, logged in step 1 below).** Re-running an id that has already finished
+cannot re-run its work: the attempts are claimed (item 2a), so the workers correctly suppress them and the
+run ends `STALLED`. That is honest — pre-fix it silently "completed" — but a fresh `run` of a finished id
+should refuse explicitly rather than warn and stall.
 
 ### The next six steps (logged 2026-11-16 for future reference — none of them started)
 
@@ -294,7 +322,12 @@ Ordered so each step makes the next one safe. **Step 1 is next.**
    - Persist bounded task stdout/stderr, so a failed run is debuggable after the fact (today output only
      survives on the DLQ/completion).
    - Workflow-level timeout and `cadence cancel <id>`, propagated to in-flight children.
-   - A **fresh** run with a reused explicit id should start its completions read at the stream head.
+   - ✅ **DONE 2026-11-16 — fresh-run cursor** (see the section above): a fresh run now starts reading
+     completions at the stream head instead of replaying the id's history.
+   - **Decide what a fresh `run` of an already-finished id should do.** Today it warns and starts, and
+     because the attempts are already claimed the tasks are suppressed, so the run honestly reports
+     `STALLED` (verified live). Truthful, but poor UX — either refuse it up front with a clear error, or
+     treat it as an implicit `--resume`.
 2. **Hardening and documented debt.** `XADD … MAXLEN ~` trimming — carefully: trimming a stream that
    still has un-acked PEL entries drops work *silently*, so trim below the group's last-delivered id.
    Revert the redundant `redis.call("XREADGROUP", …)`. Promote the smoke/demo scripts into Redis-gated

@@ -37,6 +37,12 @@ export interface CompletionSource {
    * batch (harmless — completions are idempotent) rather than skipping it.
    */
   cursor(): string;
+  /**
+   * Position of the newest entry currently in the stream (`"0"` when the stream
+   * is empty). A fresh run starts reading here, so it can never apply a
+   * completion published by an earlier run that used the same workflow id.
+   */
+  headCursor(): Promise<string>;
   /** Restore a persisted position, so a resumed run replays from where it stopped. */
   seek(cursor: string): void;
 }
@@ -170,8 +176,9 @@ export class WorkflowOrchestrator {
       }
       console.warn(
         `[orchestrator] ${workflowId} previously finished ${persistedState}; ` +
-          `starting a fresh run (pass --resume to keep it, or use a new id to ` +
-          `avoid replaying its completions)`
+          `starting a fresh run. Its task attempts are already claimed, so they ` +
+          `will not execute again — pass --resume to keep the existing result, ` +
+          `or use a new --workflow-id to genuinely re-run it.`
       );
     }
 
@@ -205,6 +212,20 @@ export class WorkflowOrchestrator {
           `(${plan.completed.length} completed, ${plan.failed.length} failed, ` +
           `${plan.inFlight.length} in flight)`
       );
+    } else {
+      // A fresh run must not read history. If this workflow id was used before,
+      // the completions stream still holds its old outcomes, and replaying them
+      // would resolve tasks that have not actually run this time (a stale
+      // FAILED would even abort the run before any work happened). Start after
+      // everything already published. It also means a fresh run no longer
+      // re-scans every other workflow's completions.
+      const head = await this.source.headCursor();
+      this.source.seek(head);
+      if (head !== "0") {
+        console.log(
+          `[orchestrator] fresh run: ignoring completions at or before ${head}`
+        );
+      }
     }
 
     // Persistence is best-effort: a store failure is logged and the run

@@ -10,6 +10,8 @@ import type { CompletionSource } from "./orchestrator.js";
 
 type StreamEntry = [string, string[]];
 type XReadReply = null | Array<[string, StreamEntry[]]>;
+/** `XREVRANGE` returns the same `[entryId, flatFields]` tuples as `XRANGE`. */
+type XRevRangeReply = null | Array<[string, string[]]>;
 
 /**
  * Fold and validate one completion entry. Returns null (loudly) for anything
@@ -58,6 +60,25 @@ export class RedisCompletionSource implements CompletionSource {
   /** Resume from a persisted position instead of the start of the stream. */
   seek(cursor: string): void {
     this.cursorPosition = cursor;
+  }
+
+  /**
+   * Position of the newest entry currently in the stream, or `"0"` when the
+   * stream is missing or empty. Read with `XREVRANGE` rather than `XINFO STREAM`
+   * because a missing key is an empty reply, not an error.
+   */
+  async headCursor(): Promise<string> {
+    const reply = (await this.redis.call(
+      "XREVRANGE",
+      COMPLETION_STREAM,
+      "+",
+      "-",
+      "COUNT",
+      "1"
+    )) as XRevRangeReply;
+
+    if (!reply || reply.length === 0) return "0";
+    return reply[0][0];
   }
 
   async read(): Promise<TaskCompletion[] | null> {
