@@ -11,9 +11,12 @@ import {
   buildInvocationId,
   computeBackoffDelayMs,
   decideInvocationClaim,
+  encodeInvocationOutcome,
   encodeRetryPayload,
   foldStreamFields,
+  hasRetryBudget,
   invocationKey,
+  invocationOutcomeKey,
   type BackoffOptions,
   type InvocationClaim,
   type TaskCompletion,
@@ -206,6 +209,17 @@ export class WorkerConsumer {
 
     const result = await this.execute(task, attempt, workflowId);
 
+    // Record a terminal outcome BEFORE routing it. If this process dies before
+    // the entry is acked, the reclaimer resolves the task from this record
+    // instead of running the command again — which matters because a reclaim
+    // re-publishes under a *new* invocation id that no claim can suppress. A
+    // failure that still has retry budget is deliberately not recorded (see
+    // core/src/invocation.ts): replaying it would abort a workflow that is
+    // about to retry.
+    if (result.status === "COMPLETED" || !hasRetryBudget(attempt, maxRetries)) {
+      await this.recordOutcome(invocationId, result);
+    }
+
     if (result.status === "COMPLETED") {
       console.log(
         `[worker:${this.workerId}] Task ${task.id} completed (exit=${result.exitCode})`
@@ -218,7 +232,7 @@ export class WorkerConsumer {
     // Publish the follow-up BEFORE acknowledging. If the process dies between
     // the publish and the ack, the entry is still pending in the PEL and can be
     // recovered. Acknowledging first would lose the task outright.
-    if (attempt < maxRetries) {
+    if (hasRetryBudget(attempt, maxRetries)) {
       // Park the retry in the retry ZSET with a due-time score instead of
       // re-publishing immediately: the promoter re-dispatches it once the
       // exponential backoff has elapsed, so a hard-failing task cannot hammer
@@ -238,6 +252,42 @@ export class WorkerConsumer {
     }
 
     await this.safeXack(messageId);
+  }
+
+  /**
+   * Persist the terminal outcome of an attempt, so a stranded entry can be
+   * resolved without running the command again. Best-effort: if the write fails
+   * the run still completes — the record only matters if this process dies
+   * before the ack, and without it the reclaimer falls back to re-dispatching.
+   */
+  private async recordOutcome(
+    invocationId: string,
+    result: TaskExecutionResult
+  ): Promise<void> {
+    try {
+      await this.redis.set(
+        invocationOutcomeKey(invocationId),
+        encodeInvocationOutcome({
+          status: result.status === "COMPLETED" ? "COMPLETED" : "FAILED",
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          timedOut: result.timedOut,
+          error: result.error
+            ? result.error.message
+            : result.status === "FAILED"
+              ? result.stderr
+              : "",
+        }),
+        "EX",
+        this.invocationTtlSeconds
+      );
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[worker:${this.workerId}] failed to record the outcome of ` +
+          `${invocationId}: ${message}`
+      );
+    }
   }
 
   /**

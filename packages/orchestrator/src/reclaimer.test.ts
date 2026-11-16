@@ -16,6 +16,7 @@ const redisMock = vi.hoisted(() => {
     pending: [] as PendingEntry[],
     claimReply: null as ClaimReply,
     existsResult: 0,
+    outcome: null as string | null,
   };
   const labels: Record<string, string> = {
     "cadence:tasks": "XADD:tasks",
@@ -25,6 +26,10 @@ const redisMock = vi.hoisted(() => {
   return {
     state,
     exists: vi.fn(async () => state.existsResult),
+    get: vi.fn(async () => {
+      state.calls.push("GET:outcome");
+      return state.outcome;
+    }),
     xadd: vi.fn(async (stream: string) => {
       state.calls.push(labels[stream] ?? `XADD:${stream}`);
       return "1-0";
@@ -51,6 +56,7 @@ const redisMock = vi.hoisted(() => {
 vi.mock("ioredis", () => ({
   Redis: class {
     exists = redisMock.exists;
+    get = redisMock.get;
     xadd = redisMock.xadd;
     xack = redisMock.xack;
     call = redisMock.call;
@@ -76,6 +82,7 @@ function taskFields(overrides: Record<string, string> = {}): string[] {
 }
 
 describe("TaskReclaimer.sweepOnce", () => {
+  let logSpy: MockInstance;
   let warnSpy: MockInstance;
   let errorSpy: MockInstance;
 
@@ -84,15 +91,19 @@ describe("TaskReclaimer.sweepOnce", () => {
     redisMock.state.pending = [];
     redisMock.state.claimReply = null;
     redisMock.state.existsResult = 0;
+    redisMock.state.outcome = null;
     redisMock.exists.mockClear();
+    redisMock.get.mockClear();
     redisMock.xadd.mockClear();
     redisMock.xack.mockClear();
     redisMock.call.mockClear();
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
   function restore(): void {
+    logSpy.mockRestore();
     warnSpy.mockRestore();
     errorSpy.mockRestore();
   }
@@ -107,11 +118,13 @@ describe("TaskReclaimer.sweepOnce", () => {
 
     expect(result.examined).toBe(1);
     expect(result.reclaimed).toEqual(["1-0"]);
+    expect(result.replayed).toEqual([]);
     expect(result.deadLettered).toEqual([]);
     // Publish-before-ack: the fresh entry must exist before the original is acked.
     expect(redisMock.state.calls).toEqual([
       "XPENDING",
       "XCLAIM",
+      "GET:outcome",
       "XADD:tasks",
       "XACK",
     ]);
@@ -165,6 +178,7 @@ describe("TaskReclaimer.sweepOnce", () => {
     expect(redisMock.state.calls).toEqual([
       "XPENDING",
       "XCLAIM",
+      "GET:outcome",
       "XADD:dlq",
       "XADD:completions",
       "XACK",
@@ -185,6 +199,118 @@ describe("TaskReclaimer.sweepOnce", () => {
     await expect(reclaimer.sweepOnce()).rejects.toThrow("redis down");
     // The entry stays pending so a later sweep (or a live reclaimer) can retry.
     expect(redisMock.xack).not.toHaveBeenCalled();
+    await reclaimer.disconnect();
+    restore();
+  });
+
+  it("replays a recorded outcome instead of re-running a finished task", async () => {
+    redisMock.state.pending = [["1-0", "worker_dead", 6000, 1]];
+    redisMock.state.existsResult = 0;
+    redisMock.state.claimReply = [["1-0", taskFields()]];
+    // The worker completed the task, recorded the outcome, then died before acking.
+    redisMock.state.outcome = JSON.stringify({
+      status: "COMPLETED",
+      exitCode: 0,
+      durationMs: 42,
+      timedOut: false,
+      error: "",
+    });
+
+    const reclaimer = new TaskReclaimer(URL, { minIdleMs: 5000 });
+    const result = await reclaimer.sweepOnce();
+
+    expect(result.replayed).toEqual(["1-0"]);
+    expect(result.reclaimed).toEqual(["1-0"]);
+    expect(result.deadLettered).toEqual([]);
+
+    // The completion is published and the entry acked — but the task is NOT
+    // re-dispatched, so the command can never run a second time.
+    expect(redisMock.state.calls).toEqual([
+      "XPENDING",
+      "XCLAIM",
+      "GET:outcome",
+      "XADD:completions",
+      "XACK",
+    ]);
+    expect(redisMock.xadd.mock.calls[0]).toEqual([
+      "cadence:completions",
+      "*",
+      "workflowId",
+      "w1",
+      "taskId",
+      "t1",
+      "status",
+      "COMPLETED",
+      "attempt",
+      "1",
+      "exitCode",
+      "0",
+      "durationMs",
+      "42",
+      "timedOut",
+      "false",
+      "error",
+      "",
+    ]);
+    await reclaimer.disconnect();
+    restore();
+  });
+
+  it("also dead-letters a replayed terminal failure", async () => {
+    redisMock.state.pending = [["1-0", "worker_dead", 6000, 1]];
+    redisMock.state.existsResult = 0;
+    redisMock.state.claimReply = [
+      ["1-0", taskFields({ attempt: "3", retries: "3" })],
+    ];
+    redisMock.state.outcome = JSON.stringify({
+      status: "FAILED",
+      exitCode: 1,
+      durationMs: 7,
+      timedOut: false,
+      error: "boom",
+    });
+
+    const reclaimer = new TaskReclaimer(URL, { minIdleMs: 5000 });
+    const result = await reclaimer.sweepOnce();
+
+    // Replayed, not re-dispatched; the DLQ record the worker never got to write
+    // is written here instead.
+    expect(result.replayed).toEqual(["1-0"]);
+    expect(result.deadLettered).toEqual([]);
+    expect(redisMock.state.calls).toEqual([
+      "XPENDING",
+      "XCLAIM",
+      "GET:outcome",
+      "XADD:dlq",
+      "XADD:completions",
+      "XACK",
+    ]);
+    expect(redisMock.xadd.mock.calls[1]).toContain("FAILED");
+    expect(redisMock.xadd.mock.calls[1]).toContain("boom");
+    await reclaimer.disconnect();
+    restore();
+  });
+
+  it("re-dispatches (loudly) when an outcome record cannot be parsed", async () => {
+    redisMock.state.pending = [["1-0", "worker_dead", 6000, 1]];
+    redisMock.state.existsResult = 0;
+    redisMock.state.claimReply = [["1-0", taskFields()]];
+    redisMock.state.outcome = "not-json";
+
+    const reclaimer = new TaskReclaimer(URL, { minIdleMs: 5000 });
+    const result = await reclaimer.sweepOnce();
+
+    // Never silent: an unreadable record falls back to re-dispatching and logs.
+    expect(result.replayed).toEqual([]);
+    expect(result.reclaimed).toEqual(["1-0"]);
+    expect(redisMock.state.calls).toEqual([
+      "XPENDING",
+      "XCLAIM",
+      "GET:outcome",
+      "XADD:tasks",
+      "XACK",
+    ]);
+    expect(errorSpy).toHaveBeenCalled();
     await reclaimer.disconnect();
     restore();
   });
@@ -215,7 +341,12 @@ describe("TaskReclaimer.sweepOnce", () => {
     const reclaimer = new TaskReclaimer(URL, { minIdleMs: 5000 });
     const result = await reclaimer.sweepOnce();
 
-    expect(result).toEqual({ examined: 0, reclaimed: [], deadLettered: [] });
+    expect(result).toEqual({
+      examined: 0,
+      reclaimed: [],
+      replayed: [],
+      deadLettered: [],
+    });
     expect(redisMock.state.calls).toEqual(["XPENDING"]);
     await reclaimer.disconnect();
     restore();

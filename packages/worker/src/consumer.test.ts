@@ -7,7 +7,7 @@ import {
   afterEach,
   type MockInstance,
 } from "vitest";
-import { TaskRunner } from "@cadence/core";
+import { TaskRunner, decodeInvocationOutcome } from "@cadence/core";
 import { WorkerConsumer, fieldsToRecord } from "./consumer.js";
 
 const DLQ_STREAM = "cadence:tasks:dlq";
@@ -17,7 +17,9 @@ const redisMock = vi.hoisted(() => {
   const calls: string[] = [];
   const published: string[] = [];
   const retries: Array<{ key: string; score: string; member: string }> = [];
+  const outcomes: Array<{ key: string; value: string }> = [];
   const claims = new Set<string>();
+  const state = { failOutcomeWrite: false };
   const labels: Record<string, string> = {
     "cadence:tasks": "XADD:tasks",
     "cadence:tasks:dlq": "XADD:dlq",
@@ -27,7 +29,9 @@ const redisMock = vi.hoisted(() => {
     calls,
     published,
     retries,
+    outcomes,
     claims,
+    state,
     xadd: vi.fn(async (stream: string) => {
       calls.push(labels[stream] ?? `XADD:${stream}`);
       published.push(stream);
@@ -43,8 +47,9 @@ const redisMock = vi.hoisted(() => {
       return 1;
     }),
     // `SET <key> <value> EX <ttl> NX`: only the first writer wins (returns
-    // "OK"); a later writer gets null. Models Redis's atomic SET NX.
-    set: vi.fn(async (key: string, _value: string, ...args: string[]) => {
+    // "OK"); a later writer gets null. Models Redis's atomic SET NX. The
+    // outcome record is a plain (non-NX) SET under a different key.
+    set: vi.fn(async (key: string, value: string, ...args: string[]) => {
       const isNx = args.includes("NX");
       calls.push(isNx ? "SET:NX" : "SET");
       if (isNx) {
@@ -52,7 +57,10 @@ const redisMock = vi.hoisted(() => {
         claims.add(key);
         return "OK";
       }
-      claims.add(key);
+      if (key.endsWith(":outcome")) {
+        if (state.failOutcomeWrite) throw new Error("redis down");
+        outcomes.push({ key, value });
+      }
       return "OK";
     }),
     xgroup: vi.fn(async () => "OK"),
@@ -130,7 +138,9 @@ describe("WorkerConsumer.handleMessage", () => {
     redisMock.calls.length = 0;
     redisMock.published.length = 0;
     redisMock.retries.length = 0;
+    redisMock.outcomes.length = 0;
     redisMock.claims.clear();
+    redisMock.state.failOutcomeWrite = false;
     redisMock.xadd.mockClear();
     redisMock.zadd.mockClear();
     redisMock.xack.mockClear();
@@ -154,7 +164,12 @@ describe("WorkerConsumer.handleMessage", () => {
       attempt: "1",
     });
 
-    expect(redisMock.calls).toEqual(["SET:NX", "XADD:completions", "XACK"]);
+    expect(redisMock.calls).toEqual([
+      "SET:NX",
+      "SET",
+      "XADD:completions",
+      "XACK",
+    ]);
     expect(redisMock.published).toEqual([COMPLETION_STREAM]);
     expect(redisMock.xadd.mock.calls[0]).toContain("COMPLETED");
   });
@@ -209,6 +224,7 @@ describe("WorkerConsumer.handleMessage", () => {
 
     expect(redisMock.calls).toEqual([
       "SET:NX",
+      "SET",
       "XADD:dlq",
       "XADD:completions",
       "XACK",
@@ -294,6 +310,7 @@ describe("WorkerConsumer.handleMessage", () => {
     expect(runSpy).toHaveBeenCalledTimes(1);
     expect(redisMock.calls).toEqual([
       "SET:NX",
+      "SET",
       "XADD:completions",
       "XACK",
       "SET:NX",
@@ -345,5 +362,90 @@ describe("WorkerConsumer.handleMessage", () => {
     // without a claim, which is the difference between at-least-once and a
     // possible duplicate side effect.
     expect(redisMock.xack).not.toHaveBeenCalled();
+  });
+
+  it("records a terminal outcome so a reclaim can resolve it without re-running", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("10-0", {
+      workflowId: "w1",
+      taskId: "done",
+      command: "echo hi",
+      timeoutMs: "5000",
+      retries: "0",
+      attempt: "1",
+    });
+
+    expect(redisMock.outcomes).toHaveLength(1);
+    expect(redisMock.outcomes[0].key).toBe("invocation:run_w1_done_1:outcome");
+    expect(decodeInvocationOutcome(redisMock.outcomes[0].value)).toEqual({
+      status: "COMPLETED",
+      exitCode: 0,
+      durationMs: expect.any(Number),
+      timedOut: false,
+      error: "",
+    });
+  });
+
+  it("does not record an outcome for a failure that still has retry budget", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("11-0", {
+      workflowId: "w1",
+      taskId: "flaky",
+      command: 'node -e "process.exit(3)"',
+      timeoutMs: "5000",
+      retries: "3",
+      attempt: "1",
+    });
+
+    // Replaying a recorded FAILED would abort a workflow that is about to
+    // retry, so a retryable failure is deliberately not recorded.
+    expect(redisMock.outcomes).toHaveLength(0);
+  });
+
+  it("records a terminally failed outcome", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("12-0", {
+      workflowId: "w1",
+      taskId: "doomed",
+      command: 'node -e "process.exit(7)"',
+      timeoutMs: "5000",
+      retries: "1",
+      attempt: "1",
+    });
+
+    expect(decodeInvocationOutcome(redisMock.outcomes[0].value)).toMatchObject({
+      status: "FAILED",
+      exitCode: 7,
+    });
+  });
+
+  it("still completes when recording the outcome fails (best-effort)", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    redisMock.state.failOutcomeWrite = true;
+
+    await internals(consumer).handleMessage("13-0", {
+      workflowId: "w1",
+      taskId: "ok",
+      command: "echo hi",
+      timeoutMs: "5000",
+      retries: "0",
+      attempt: "1",
+    });
+
+    // The record only matters if this process dies before the ack, so losing it
+    // must not fail the run — the completion still goes out and the entry acks.
+    expect(redisMock.published).toEqual([COMPLETION_STREAM]);
+    expect(redisMock.calls).toEqual([
+      "SET:NX",
+      "SET",
+      "XADD:completions",
+      "XACK",
+    ]);
+    expect(errorSpy).toHaveBeenCalled();
+    errorSpy.mockRestore();
   });
 });

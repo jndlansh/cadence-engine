@@ -5,8 +5,13 @@ import {
   DLQ_STREAM,
   TASKS_STREAM,
   WORKER_GROUP,
+  buildInvocationId,
+  decodeInvocationOutcome,
   foldStreamFields,
+  hasRetryBudget,
   heartbeatKey,
+  invocationOutcomeKey,
+  type InvocationOutcome,
 } from "@cadence/core";
 
 /** XPENDING extended form: [entryId, consumer, idleMs, deliveryCount]. */
@@ -31,8 +36,10 @@ export interface ReclaimerOptions {
 export interface SweepResult {
   /** Pending entries seen in the PEL this sweep. */
   examined: number;
-  /** Entry ids reclaimed from dead workers and re-dispatched. */
+  /** Entry ids reclaimed from dead workers (re-dispatched *or* replayed). */
   reclaimed: string[];
+  /** Entry ids whose recorded outcome was replayed instead of being re-run. */
+  replayed: string[];
   /** Entry ids routed to the DLQ (malformed or retries exhausted). */
   deadLettered: string[];
 }
@@ -51,6 +58,12 @@ export interface SweepResult {
  * claimed entry is invisible to every worker. Reclaim therefore means
  * "re-publish as a fresh stream entry, then ack the stranded original" —
  * publish-before-ack, exactly like the worker's retry path.
+ *
+ * Before re-publishing, it consults the attempt's **recorded outcome**: if the
+ * dead worker had already finished terminally, that outcome is replayed as a
+ * completion instead of the task being run again. This is what stops a reclaim
+ * from duplicating a side effect — a re-publish carries a new invocation id
+ * (`attempt + 1`), which the per-attempt claim cannot suppress.
  */
 export class TaskReclaimer {
   private readonly redis: Redis;
@@ -61,6 +74,7 @@ export class TaskReclaimer {
   private timer: ReturnType<typeof setInterval> | null = null;
   private sweeping = false;
   private totalReclaimed = 0;
+  private totalReplayed = 0;
   private totalDeadLettered = 0;
 
   constructor(redisUrl?: string, options?: ReclaimerOptions) {
@@ -78,6 +92,7 @@ export class TaskReclaimer {
     const result: SweepResult = {
       examined: pending.length,
       reclaimed: [],
+      replayed: [],
       deadLettered: [],
     };
 
@@ -105,9 +120,34 @@ export class TaskReclaimer {
       const currentAttempt = Number(fields["attempt"] ?? "1");
       const maxRetries = Number(fields["retries"] ?? "0");
 
+      // If that attempt had already reached a terminal outcome, the work is
+      // done — the worker simply died before acking. Resolve it from the record
+      // instead of running the command again: a re-dispatch carries a *new*
+      // invocation id (`attempt + 1`), which no claim can suppress, so this is
+      // the only place the cross-attempt duplicate can be stopped.
+      const recorded = await this.readOutcome(
+        buildInvocationId(workflowId, taskId, currentAttempt)
+      );
+      if (recorded) {
+        console.log(
+          `[reclaimer] ${taskId} attempt ${currentAttempt} had already ` +
+            `${recorded.status} — replaying its outcome instead of re-running it`
+        );
+        // A terminal failure also owed a DLQ entry, which the worker may not
+        // have written before it died.
+        if (recorded.status === "FAILED") {
+          await this.routeToDlq(fields, currentAttempt);
+        }
+        await this.publishOutcome(fields, currentAttempt, recorded);
+        result.replayed.push(entryId);
+        result.reclaimed.push(entryId);
+        await this.ack(entryId);
+        continue;
+      }
+
       // Mirror the worker's budget exactly: republish only while the attempt
       // that just died was still inside the retry allowance.
-      if (currentAttempt < maxRetries) {
+      if (hasRetryBudget(currentAttempt, maxRetries)) {
         await this.republish(fields, currentAttempt + 1);
         result.reclaimed.push(entryId);
         console.warn(
@@ -131,14 +171,16 @@ export class TaskReclaimer {
     }
 
     this.totalReclaimed += result.reclaimed.length;
+    this.totalReplayed += result.replayed.length;
     this.totalDeadLettered += result.deadLettered.length;
     return result;
   }
 
-  /** Cumulative reclaim/DLQ totals since construction — for demos and metrics. */
-  getStats(): { reclaimed: number; deadLettered: number } {
+  /** Cumulative reclaim/replay/DLQ totals since construction — for demos and metrics. */
+  getStats(): { reclaimed: number; replayed: number; deadLettered: number } {
     return {
       reclaimed: this.totalReclaimed,
+      replayed: this.totalReplayed,
       deadLettered: this.totalDeadLettered,
     };
   }
@@ -219,6 +261,55 @@ export class TaskReclaimer {
     if (!reply || reply.length === 0) return null;
     const [, flat] = reply[0];
     return foldStreamFields(flat);
+  }
+
+  /**
+   * Read the outcome the dead worker recorded for an attempt, if it got that
+   * far. A record that exists but cannot be parsed is logged and treated as
+   * absent, which falls back to re-dispatching — never a silent discard.
+   */
+  private async readOutcome(
+    invocationId: string
+  ): Promise<InvocationOutcome | null> {
+    const key = invocationOutcomeKey(invocationId);
+    const raw = await this.redis.get(key);
+    if (raw === null) return null;
+
+    const outcome = decodeInvocationOutcome(raw);
+    if (!outcome) {
+      console.error(
+        `[reclaimer] unreadable outcome record at ${key} — re-dispatching ` +
+          `${invocationId} instead of replaying it`
+      );
+    }
+    return outcome;
+  }
+
+  private async publishOutcome(
+    fields: Record<string, string>,
+    attempt: number,
+    outcome: InvocationOutcome
+  ): Promise<void> {
+    await this.redis.xadd(
+      COMPLETION_STREAM,
+      "*",
+      "workflowId",
+      fields["workflowId"] ?? "",
+      "taskId",
+      fields["taskId"] ?? "",
+      "status",
+      outcome.status,
+      "attempt",
+      String(attempt),
+      "exitCode",
+      String(outcome.exitCode),
+      "durationMs",
+      String(outcome.durationMs),
+      "timedOut",
+      String(outcome.timedOut),
+      "error",
+      outcome.error ?? ""
+    );
   }
 
   private async republish(

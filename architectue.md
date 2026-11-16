@@ -310,18 +310,55 @@ cannot re-run its work: the attempts are claimed (item 2a), so the workers corre
 run ends `STALLED`. That is honest — pre-fix it silently "completed" — but a fresh `run` of a finished id
 should refuse explicitly rather than warn and stall.
 
+### Cross-Attempt Duplicate Window (step 1, item 1) `[STATUS: COMPLETED]`
+
+> The idempotency claim is per **attempt**, so a task re-published by the reclaimer as `attempt + 1`
+> carried a *new* invocation id that no claim could suppress. A worker that died between finishing its
+> command and acking the entry therefore had its work executed a second time.
+
+- [x] **The worker records a terminal outcome before routing it**, under `invocation:<invocationId>:outcome`
+  (`core/src/invocation.ts`: `InvocationOutcomeSchema`, `encodeInvocationOutcome` /
+  `decodeInvocationOutcome`, `invocationOutcomeKey`). Best-effort: a failed write still lets the run
+  complete, because the record only matters if the process dies before the ack.
+- [x] **Only terminal outcomes are recorded.** A failure that still has retry budget is deliberately
+  absent — replaying a `FAILED` completion for an attempt that is about to be retried would abort the
+  workflow. `hasRetryBudget()` is now the single definition shared by the worker's retry branch and the
+  reclaimer's budget, so the two cannot drift apart.
+- [x] **The reclaimer resolves from the record before re-publishing.** If the dead attempt has a recorded
+  outcome, that outcome is replayed as a completion (plus, for a terminal failure, the DLQ record the
+  worker never got to write) and the entry is acked — **the command is never re-dispatched**. A record
+  that exists but cannot be parsed is logged and falls back to re-dispatching: never a silent discard.
+- [x] `SweepResult` / `getStats()` gained `replayed`, so a replay is visible instead of being folded into
+  "reclaimed".
+- [x] 16 new unit tests (core `invocation` +9, worker `consumer` +4, reclaimer +3) → `pnpm test`
+  **171 passing**. Eight were confirmed to **fail** pre-fix, including `replayed` coming back empty —
+  i.e. the reclaimer re-dispatching instead of replaying.
+- [x] **Live-verified (2026-11-16, throwaway `memurai.exe`, stopped afterwards):**
+  - *Regression on the load-bearing path:* `scripts/demo-failover.ts` still reports `reclaimed=1 DLQ=0`
+    and recovers — a worker SIGKILLed **mid-command** records no outcome, so it is correctly re-dispatched
+    as attempt 2.
+  - *New behaviour:* a task entry stranded under a dead consumer, with a recorded `COMPLETED` outcome,
+    swept to `examined=1 reclaimed=1 replayed=1` — and `XLEN cadence:tasks` stayed at **1** (no
+    re-dispatch), `XPENDING` fell to 0, and `cadence:completions` received the replayed outcome
+    (`attempt 1`, `exitCode 0`, `durationMs 42` preserved).
+
+**What is still exposed, and why it is inherent.** A worker killed *while the command is running* has no
+record, so its task is re-dispatched and the command runs again — at-least-once, by design. Closing that
+needs the *task* to be idempotent, and the natural lever is the invocation id, which the runner could
+expose to the command as an env var (`CADENCE_INVOCATION_ID`). Logged for step 4 (per-task `env`).
+
 ### The next six steps (logged 2026-11-16 for future reference — none of them started)
 
 Ordered so each step makes the next one safe. **Step 1 is next.**
 
 1. **Close the remaining correctness holes.**
-   - The **cross-attempt** duplicate window: the reclaimer re-publishes a dead worker's task as
-     `attempt + 1`, which a per-attempt claim cannot suppress. Either make dedup decision-level (key on
-     workflow + task and cache the outcome) or stop the reclaimer charging a retry for what is a *worker
-     death*, not a task failure.
+   - ✅ **DONE 2026-11-16 — cross-attempt duplicate window** (see the section above): the worker records a
+     terminal outcome and the reclaimer replays it instead of re-running the command.
    - Persist bounded task stdout/stderr, so a failed run is debuggable after the fact (today output only
      survives on the DLQ/completion).
    - Workflow-level timeout and `cadence cancel <id>`, propagated to in-flight children.
+   - Expose the invocation id to the task itself (e.g. `CADENCE_INVOCATION_ID`), so a command that *must*
+     be idempotent has the lever to be — the mission promises this and nothing currently provides it.
    - ✅ **DONE 2026-11-16 — fresh-run cursor** (see the section above): a fresh run now starts reading
      completions at the stream head instead of replaying the id's history.
    - **Decide what a fresh `run` of an already-finished id should do.** Today it warns and starts, and
