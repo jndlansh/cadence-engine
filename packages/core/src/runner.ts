@@ -5,6 +5,7 @@ import {
   type TaskRunnerOptions,
   type TaskExecutionStatus,
 } from "./types.js";
+import { buildInvocationId } from "./invocation.js";
 
 const SIGNAL_EXIT_BASE = 128;
 
@@ -60,7 +61,7 @@ export class TaskRunner {
     workflowId: string,
     options?: TaskRunnerOptions
   ): Promise<TaskExecutionResult> {
-    const invocationId = `run_${workflowId}_${task.id}_${attempt}`;
+    const invocationId = buildInvocationId(workflowId, task.id, attempt);
     const startTime = Date.now();
 
     const child = spawnCommand(task.command);

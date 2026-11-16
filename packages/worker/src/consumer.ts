@@ -4,24 +4,36 @@ import {
   COMPLETION_STREAM,
   DEFAULT_REDIS_URL,
   DLQ_STREAM,
+  INVOCATION_TTL_SECONDS,
   RETRY_ZSET,
   TASKS_STREAM,
   WORKER_GROUP as GROUP_NAME,
+  buildInvocationId,
   computeBackoffDelayMs,
+  decideInvocationClaim,
   encodeRetryPayload,
   foldStreamFields,
+  invocationKey,
   type BackoffOptions,
+  type InvocationClaim,
   type TaskCompletion,
   type TaskDefinition,
   type TaskExecutionResult,
 } from "@cadence/core";
 import { WorkerHeartbeat, type HeartbeatOptions } from "./heartbeat.js";
 
+export interface IdempotencyOptions {
+  /** Seconds an invocation claim survives without renewal. */
+  ttlSeconds?: number;
+}
+
 export interface WorkerConsumerOptions {
   /** Liveness-beacon tuning; the demo shrinks these to fail fast. */
   heartbeat?: HeartbeatOptions;
   /** Exponential-backoff tuning for failed-task retries. */
   backoff?: BackoffOptions;
+  /** Idempotency claim tuning. */
+  idempotency?: IdempotencyOptions;
 }
 
 interface StreamTaskPayload {
@@ -62,6 +74,7 @@ export class WorkerConsumer {
   private readonly redisUrl: string;
   private readonly heartbeatOptions?: HeartbeatOptions;
   private readonly backoffOptions?: BackoffOptions;
+  private readonly invocationTtlSeconds: number;
   private heartbeat: WorkerHeartbeat | null = null;
   private shutdownRequested = false;
 
@@ -72,6 +85,8 @@ export class WorkerConsumer {
     this.runner = new TaskRunner();
     this.heartbeatOptions = options?.heartbeat;
     this.backoffOptions = options?.backoff;
+    this.invocationTtlSeconds =
+      options?.idempotency?.ttlSeconds ?? INVOCATION_TTL_SECONDS;
   }
 
   /**
@@ -165,6 +180,25 @@ export class WorkerConsumer {
     const attempt = Number(payload.attempt);
     const maxRetries = Number(payload.retries);
     const workflowId = payload.workflowId;
+    const invocationId = buildInvocationId(workflowId, task.id, attempt);
+
+    // Idempotency guard. Delivery is at-least-once, so this exact attempt can
+    // arrive twice — a reclaimer re-publish, or a retry scheduled by both the
+    // retry ZSET and the reclaimer. Claiming the invocation before running
+    // means only the first delivery executes; later ones are no-ops. Claiming
+    // *before* the command is deliberate: if the process dies after the claim,
+    // the entry stays pending and is recovered, whereas claiming after the
+    // command would let a duplicate re-run a side effect that already happened.
+    if ((await this.claimInvocation(invocationId)) === "DUPLICATE") {
+      console.warn(
+        `[worker:${this.workerId}] duplicate delivery of ${invocationId} ` +
+          `— already claimed, skipping execution`
+      );
+      // Whoever holds the claim publishes the outcome, so acking this copy is
+      // safe; leaving it pending would only make the reclaimer reclaim it again.
+      await this.safeXack(messageId);
+      return;
+    }
 
     console.log(
       `[worker:${this.workerId}] Running task=${task.id} attempt=${attempt} workflow=${workflowId}`
@@ -207,6 +241,25 @@ export class WorkerConsumer {
   }
 
   /**
+   * Claim an invocation so it can run at most once. `SET ... NX` is atomic, so
+   * exactly one delivery of a given attempt wins, even across workers. The
+   * claim carries the owner's id and a TTL so a late duplicate is still
+   * suppressed, while stale claims eventually expire instead of accumulating.
+   */
+  private async claimInvocation(
+    invocationId: string
+  ): Promise<InvocationClaim> {
+    const reply = await this.redis.set(
+      invocationKey(invocationId),
+      this.workerId,
+      "EX",
+      this.invocationTtlSeconds,
+      "NX"
+    );
+    return decideInvocationClaim(reply);
+  }
+
+  /**
    * Execute a task, converting an unexpected runner rejection into a FAILED
    * result. Scoping the try/catch to the runner alone keeps bookkeeping
    * (XADD/XACK) failures from being mistaken for task failures.
@@ -223,7 +276,7 @@ export class WorkerConsumer {
       console.error(`[worker:${this.workerId}] Task ${task.id} threw:`, error);
       return {
         taskId: task.id,
-        invocationId: `run_${workflowId}_${task.id}_${attempt}`,
+        invocationId: buildInvocationId(workflowId, task.id, attempt),
         status: "FAILED",
         exitCode: 1,
         stdout: "",

@@ -8,9 +8,11 @@
  *   HEARTBEAT_INTERVAL_MS  default 3000
  *   RETRY_BASE_DELAY_MS    default 1000
  *   RETRY_MAX_DELAY_MS     default 60000
+ *   INVOCATION_TTL_SECONDS default 86400 (idempotency claim lifetime)
  *
  * Prints `WORKER_READY id=<id>` once it starts, so a parent can wait for it.
  */
+import { INVOCATION_TTL_SECONDS } from "../packages/core/src/index.js";
 import { WorkerConsumer } from "../packages/worker/src/consumer.js";
 
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -24,6 +26,11 @@ async function main(): Promise<void> {
     backoff: {
       baseDelayMs: Number(process.env.RETRY_BASE_DELAY_MS ?? "1000"),
       maxDelayMs: Number(process.env.RETRY_MAX_DELAY_MS ?? "60000"),
+    },
+    idempotency: {
+      ttlSeconds: Number(
+        process.env.INVOCATION_TTL_SECONDS ?? String(INVOCATION_TTL_SECONDS)
+      ),
     },
   });
 

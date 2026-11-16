@@ -7,6 +7,7 @@ import {
   afterEach,
   type MockInstance,
 } from "vitest";
+import { TaskRunner } from "@cadence/core";
 import { WorkerConsumer, fieldsToRecord } from "./consumer.js";
 
 const DLQ_STREAM = "cadence:tasks:dlq";
@@ -16,6 +17,7 @@ const redisMock = vi.hoisted(() => {
   const calls: string[] = [];
   const published: string[] = [];
   const retries: Array<{ key: string; score: string; member: string }> = [];
+  const claims = new Set<string>();
   const labels: Record<string, string> = {
     "cadence:tasks": "XADD:tasks",
     "cadence:tasks:dlq": "XADD:dlq",
@@ -25,6 +27,7 @@ const redisMock = vi.hoisted(() => {
     calls,
     published,
     retries,
+    claims,
     xadd: vi.fn(async (stream: string) => {
       calls.push(labels[stream] ?? `XADD:${stream}`);
       published.push(stream);
@@ -39,6 +42,19 @@ const redisMock = vi.hoisted(() => {
       calls.push("XACK");
       return 1;
     }),
+    // `SET <key> <value> EX <ttl> NX`: only the first writer wins (returns
+    // "OK"); a later writer gets null. Models Redis's atomic SET NX.
+    set: vi.fn(async (key: string, _value: string, ...args: string[]) => {
+      const isNx = args.includes("NX");
+      calls.push(isNx ? "SET:NX" : "SET");
+      if (isNx) {
+        if (claims.has(key)) return null;
+        claims.add(key);
+        return "OK";
+      }
+      claims.add(key);
+      return "OK";
+    }),
     xgroup: vi.fn(async () => "OK"),
     call: vi.fn(async () => null),
     quit: vi.fn(() => "OK"),
@@ -50,6 +66,7 @@ vi.mock("ioredis", () => ({
     xadd = redisMock.xadd;
     zadd = redisMock.zadd;
     xack = redisMock.xack;
+    set = redisMock.set;
     xgroup = redisMock.xgroup;
     call = redisMock.call;
     quit = redisMock.quit;
@@ -113,9 +130,11 @@ describe("WorkerConsumer.handleMessage", () => {
     redisMock.calls.length = 0;
     redisMock.published.length = 0;
     redisMock.retries.length = 0;
+    redisMock.claims.clear();
     redisMock.xadd.mockClear();
     redisMock.zadd.mockClear();
     redisMock.xack.mockClear();
+    redisMock.set.mockClear();
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
   });
 
@@ -135,7 +154,7 @@ describe("WorkerConsumer.handleMessage", () => {
       attempt: "1",
     });
 
-    expect(redisMock.calls).toEqual(["XADD:completions", "XACK"]);
+    expect(redisMock.calls).toEqual(["SET:NX", "XADD:completions", "XACK"]);
     expect(redisMock.published).toEqual([COMPLETION_STREAM]);
     expect(redisMock.xadd.mock.calls[0]).toContain("COMPLETED");
   });
@@ -155,7 +174,7 @@ describe("WorkerConsumer.handleMessage", () => {
     });
 
     // Publish-before-ack: ZADD first, XACK last, nothing on the streams.
-    expect(redisMock.calls).toEqual(["ZADD", "XACK"]);
+    expect(redisMock.calls).toEqual(["SET:NX", "ZADD", "XACK"]);
     expect(redisMock.published).toEqual([]);
     expect(redisMock.retries).toHaveLength(1);
 
@@ -188,7 +207,12 @@ describe("WorkerConsumer.handleMessage", () => {
       attempt: "1",
     });
 
-    expect(redisMock.calls).toEqual(["XADD:dlq", "XADD:completions", "XACK"]);
+    expect(redisMock.calls).toEqual([
+      "SET:NX",
+      "XADD:dlq",
+      "XADD:completions",
+      "XACK",
+    ]);
     expect(redisMock.published).toEqual([DLQ_STREAM, COMPLETION_STREAM]);
     expect(redisMock.xadd.mock.calls[1]).toContain("FAILED");
   });
@@ -246,5 +270,80 @@ describe("WorkerConsumer.handleMessage", () => {
     expect(completionCall).toContain("timedOut");
     expect(completionCall).toContain("false");
     expect(completionCall).toContain("error");
+  });
+
+  it("runs the command exactly once when the same invocation is delivered twice", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const runSpy = vi.spyOn(TaskRunner.prototype, "run");
+
+    const fields = {
+      workflowId: "w1",
+      taskId: "once",
+      command: "echo hi",
+      timeoutMs: "5000",
+      retries: "0",
+      attempt: "1",
+    };
+
+    // Two distinct stream entries, same invocation id: the second is a re-delivery.
+    await internals(consumer).handleMessage("7-0", fields);
+    await internals(consumer).handleMessage("7-1", fields);
+
+    // The duplicate is a no-op: no second execution, no second completion.
+    expect(runSpy).toHaveBeenCalledTimes(1);
+    expect(redisMock.calls).toEqual([
+      "SET:NX",
+      "XADD:completions",
+      "XACK",
+      "SET:NX",
+      "XACK",
+    ]);
+    expect(redisMock.published).toEqual([COMPLETION_STREAM]);
+    expect(warnSpy).toHaveBeenCalled();
+
+    runSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("still runs a later attempt of the same task (dedup is per attempt)", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+    const runSpy = vi.spyOn(TaskRunner.prototype, "run");
+
+    const base = {
+      workflowId: "w1",
+      taskId: "retried",
+      command: "echo hi",
+      timeoutMs: "5000",
+      retries: "3",
+    };
+    await internals(consumer).handleMessage("8-0", { ...base, attempt: "1" });
+    await internals(consumer).handleMessage("8-1", { ...base, attempt: "2" });
+
+    // A retry is new work, so it must not be suppressed by the attempt-1 claim.
+    expect(runSpy).toHaveBeenCalledTimes(2);
+
+    runSpy.mockRestore();
+  });
+
+  it("does not acknowledge when the idempotency claim fails (fail-closed)", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+    redisMock.set.mockRejectedValueOnce(new Error("redis down"));
+
+    await expect(
+      internals(consumer).handleMessage("9-0", {
+        workflowId: "w1",
+        taskId: "guarded",
+        command: "echo hi",
+        timeoutMs: "5000",
+        retries: "0",
+        attempt: "1",
+      })
+    ).rejects.toThrow("redis down");
+
+    // The entry stays pending in the PEL and is recovered later — never acked
+    // without a claim, which is the difference between at-least-once and a
+    // possible duplicate side effect.
+    expect(redisMock.xack).not.toHaveBeenCalled();
   });
 });

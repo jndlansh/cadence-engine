@@ -5,7 +5,7 @@ Cadence is an asynchronous, distributed, fault-tolerant DAG (Directed Acyclic Gr
 - **Strict Topological Invariant:** No child task can execute before all parent dependencies emit clean success exit codes (`0`).
 - **Deterministic Cycle Rejection:** Invalid cyclic pipelines are detected and rejected at submission time using Kahn’s Algorithm ($O(V + E)$).
 - **At-Least-Once Delivery & Failure Recovery:** Tasks lost to sudden worker crashes (`kill -9`, hardware loss, network partition) are identified via missing heartbeats and claimed from the Redis Pending Entries List (PEL) without dropping jobs.
-- **Idempotency Safeguards:** Every task attempt receives a deterministic invocation identifier (`run_<workflow_id>_<task_id>_<attempt>`) to prevent duplicate executions from producing side-effects.
+- **Idempotency Safeguards:** Every task attempt receives a deterministic invocation identifier (`run_<workflow_id>_<task_id>_<attempt>`) to prevent duplicate executions from producing side-effects. Enforced by the worker's atomic claim (`SET invocation:<id> … NX`) before the command runs — see the Idempotency Guard section in §3.
 
 ---
 
@@ -43,6 +43,8 @@ cadence/
     │   ├── src/retry.test.ts        # Vitest suite for backoff delays & payload encoding
     │   ├── src/state.ts             # Pure workflow lifecycle state machine (reducer)
     │   ├── src/state.test.ts        # Vitest suite for lifecycle transitions
+    │   ├── src/invocation.ts        # Pure idempotency contract: invocation id, claim key, decision
+    │   ├── src/invocation.test.ts   # Vitest suite for id building, key naming & claim decisions
     │   └── src/index.ts             # Core package barrel export
     ├── orchestrator/                # Coordination layer & scheduler daemon
     │   ├── src/scheduler.ts         # Redis Streams task dispatcher (XADD)
@@ -190,6 +192,50 @@ to), so it is routed to the DLQ only.
 **Live (verified 2026-11-01 via a throwaway `memurai.exe` on 127.0.0.1:6379, stopped afterwards):**
 `pnpm cadence run workflows/data-pipeline.yaml --workers 2` → live progress through the 6-task DAG → `COMPLETED`, exit 0. `pnpm cadence status <id>` prints the persisted table. A failing workflow exits 1 (fail-fast held: the child never ran); a missing id exits 1; an unknown command exits 2; **with Redis stopped, `run`/`status` print one actionable message and exit 4** (no ioredis retry storm), and a missing `status` argument exits 2.
 
+### Idempotency Guard (post-roadmap item 2a) `[STATUS: COMPLETED]`
+
+> The mission has always *claimed* idempotency via `run_<workflow_id>_<task_id>_<attempt>`, but nothing
+> consumed that id: because delivery is at-least-once, a redelivery re-ran a real command. This closes
+> the gap between the documented guarantee and the code.
+
+- [x] **Pure contract** (`core/src/invocation.ts`): `buildInvocationId` — the single place the id is
+  formatted (it was duplicated inline in `runner.ts` and `consumer.ts` before), `invocationKey`
+  (`invocation:<id>`), `INVOCATION_TTL_SECONDS` (default 86 400), and `decideInvocationClaim`, which
+  pins ioredis's `SET ... NX` reply convention (`"OK"` = acquire, `null` = duplicate) in one tested place.
+- [x] **The worker claims before executing** (`consumer.ts`): `SET invocation:<id> <workerId> EX <ttl> NX`
+  runs immediately before `TaskRunner.run()`. The first delivery wins; a later delivery of the same
+  invocation logs a duplicate warning, **does not execute the command**, and acks its entry. Claiming
+  *before* the command is deliberate: a crash after the claim leaves the entry pending and recoverable,
+  whereas claiming after would let a duplicate repeat a side effect that already happened.
+- [x] **Fail-closed**: if the claim itself fails, the entry is not acked — it stays pending and is
+  recovered, rather than running unguarded.
+- [x] **Scoped per attempt, not per task**: a genuine retry (attempt 2) has a different invocation id and
+  runs normally, so the retry budget is unaffected.
+- [x] `INVOCATION_TTL_SECONDS` wired through `scripts/worker-node.ts` for the spawned-worker path.
+- [x] 9 new unit tests (core `invocation` 6, worker `consumer` +3). One is a true regression: it fails
+  against the pre-guard code with "expected run to be called 1 times, but got 2 times". `pnpm test` → **132 passing**.
+- [x] **Live-verified** (2026-11-16, throwaway `memurai.exe` on `127.0.0.1:6379`): a clean
+  `scripts/smoke-phase3.ts` run executed each of the 3 tasks once (XPENDING 0, DLQ 2, ZCARD 0, one
+  `invocation:*` key per execution); re-running it with the claim keys intact suppressed all three
+  (`duplicate delivery of run_… — already claimed, skipping execution`); clearing `invocation:*` restored
+  normal execution. `pnpm cadence run workflows/data-pipeline.yaml --workers 2` → `COMPLETED` 6/6, 6 claim keys.
+
+**Operational consequence (deliberate).** The invocation id is deterministic, so re-running a workflow
+*with the same workflow id* is the same invocation and is suppressed for the claim TTL. The smoke and
+demo scripts use fixed ids (`smoke_wf_1`, `demo_wf_1`, `demo_wf_1`/`failed_wf_1`, `failover_wf_1`), so
+their cleanup recipes must now also clear `invocation:*`:
+
+```bash
+memurai-cli EVAL "local k=redis.call('keys',ARGV[1]) for i=1,#k do redis.call('del',k[i]) end return #k" 0 "invocation:*"
+```
+
+The CLI sidesteps this by defaulting to a unique id (`<workflow>_<timestamp>`).
+
+**Residual window — stated plainly.** Idempotency is keyed on the *attempt*, so a task whose worker
+**died** is re-published by the reclaimer as **attempt + 1** — a new invocation — and may still run the
+command a second time. Closing that fully means either task-level (not attempt-level) dedup, or
+restart-resume reconciling `workflow:<id>:state` before re-dispatch.
+
 ---
 
 ## 4. Operating Rules for AI Coding Agents
@@ -219,5 +265,6 @@ Any AI assistant modifying or contributing to this repository **MUST** strictly 
    - Unit tests are necessary but never sufficient for Redis Streams code. Any change to `scheduler.ts` or `consumer.ts` must be exercised against a running Redis with `scripts/smoke-phase3.ts`.
    - Redis returns stream entry fields as a **flat `[field, value, field, value, ...]` array**, not an object. Never index entry fields by key without folding them first — doing so silently discards every task.
    - Terminal task outcomes are published to the `cadence:completions` stream. **Publish a completion before `XACK`**, exactly as with re-dispatch and DLQ routing: acknowledging first creates an unrecoverable window.
+   - Every task attempt is claimed with `SET invocation:<invocationId> … NX` (in `core/src/invocation.ts`, key `invocation:<id>`) **before** the command runs. A delivery that loses the claim must not execute the command; it is logged and acked. Claiming before the command is deliberate — a crash after the claim stays recoverable via the PEL.
    - Never discard anything silently. A dropped task must be logged and/or routed to the DLQ; two separate bugs hid behind a silent discard.
    - Before accepting a regression test, confirm it actually **fails** against the pre-fix code.
