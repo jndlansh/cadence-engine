@@ -12,6 +12,7 @@ import {
   type ParsedWorkflow,
   type TaskCompletion,
   type TaskDefinition,
+  type TaskRunRecord,
   type WorkflowStateSnapshot,
 } from "@cadence/core";
 import {
@@ -27,18 +28,25 @@ const WF = "wf_test";
 
 class FakeSink implements TaskSink {
   readonly waves: string[][] = [];
+  readonly attempts: number[] = [];
 
   async dispatchTasks(
     _workflowId: string,
-    tasks: TaskDefinition[]
+    tasks: TaskDefinition[],
+    attempt = 1
   ): Promise<string[]> {
     this.waves.push(tasks.map((t) => t.id));
+    this.attempts.push(attempt);
     return tasks.map((t) => `stream-${t.id}`);
   }
 }
 
 class FakeSource implements CompletionSource {
   private readonly queue: TaskCompletion[] = [];
+  private position = "0";
+  private reads = 0;
+  /** Every cursor a resume asked to replay from. */
+  readonly seeks: string[] = [];
 
   push(...completions: TaskCompletion[]): void {
     this.queue.push(...completions);
@@ -46,13 +54,32 @@ class FakeSource implements CompletionSource {
 
   async read(): Promise<TaskCompletion[] | null> {
     const next = this.queue.shift();
-    return next ? [next] : null;
+    if (!next) return null;
+    this.reads += 1;
+    this.position = `entry-${this.reads}`;
+    return [next];
+  }
+
+  cursor(): string {
+    return this.position;
+  }
+
+  seek(cursor: string): void {
+    this.seeks.push(cursor);
+    this.position = cursor;
   }
 }
 
 class FakeStateStore implements WorkflowStateStore {
   readonly saves: WorkflowStateSnapshot[] = [];
   failNext = false;
+  failLoad = false;
+  private seeded: WorkflowStateSnapshot | null = null;
+
+  /** Pretend a previous run persisted this snapshot. */
+  seed(snapshot: WorkflowStateSnapshot): void {
+    this.seeded = snapshot;
+  }
 
   async save(snapshot: WorkflowStateSnapshot): Promise<void> {
     if (this.failNext) {
@@ -63,6 +90,8 @@ class FakeStateStore implements WorkflowStateStore {
   }
 
   async load(): Promise<WorkflowStateSnapshot | null> {
+    if (this.failLoad) throw new Error("state store down");
+    if (this.seeded) return this.seeded;
     return this.saves.length > 0 ? this.saves[this.saves.length - 1] : null;
   }
 
@@ -91,6 +120,38 @@ function completion(
     attempt: 1,
     exitCode: status === "COMPLETED" ? 0 : 1,
     durationMs: 5,
+  };
+}
+
+/** A snapshot as a previous, interrupted run would have persisted it. */
+function persistedRun(
+  tasks: Array<{
+    id: string;
+    status: TaskRunRecord["status"];
+    attempt?: number;
+  }>,
+  overrides: Partial<WorkflowStateSnapshot> = {}
+): WorkflowStateSnapshot {
+  const records: Record<string, TaskRunRecord> = {};
+  for (const task of tasks) {
+    const dispatched = task.status !== "PENDING";
+    records[task.id] = {
+      taskId: task.id,
+      status: task.status,
+      attempt: task.attempt ?? (dispatched ? 1 : 0),
+      dispatchedAt: dispatched ? 10 : 0,
+    };
+  }
+
+  return {
+    workflowId: WF,
+    state: "RUNNING",
+    startedAt: 1,
+    updatedAt: 20,
+    cursor: "5-0",
+    failed: [],
+    tasks: records,
+    ...overrides,
   };
 }
 
@@ -402,6 +463,202 @@ describe("WorkflowOrchestrator", () => {
     expect(types).toContain("TASK_COMPLETED");
     expect(types[types.length - 1]).toBe("WORKFLOW_FINISHED");
     expect(result.status).toBe("COMPLETED");
+  });
+
+  describe("resume", () => {
+    it("continues a RUNNING run instead of restarting it", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("b"), completion("c"));
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun([
+          { id: "a", status: "COMPLETED" },
+          { id: "b", status: "RUNNING" },
+          { id: "c", status: "PENDING" },
+        ])
+      );
+
+      const result = await new WorkflowOrchestrator(sink, source, {
+        stateStore: store,
+      }).run(WF, workflow(LINEAR));
+
+      // `a` is not re-run, `b` is re-dispatched, `c` unblocks normally.
+      expect(sink.waves).toEqual([["b"], ["c"]]);
+      expect(result.status).toBe("COMPLETED");
+      expect(result.resumed).toBe(true);
+      expect(result.completed).toEqual(["a", "b", "c"]);
+    });
+
+    it("replays completions from the persisted cursor", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("b"), completion("c"));
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun(
+          [
+            { id: "a", status: "COMPLETED" },
+            { id: "b", status: "RUNNING" },
+            { id: "c", status: "PENDING" },
+          ],
+          { cursor: "42-0" }
+        )
+      );
+
+      await new WorkflowOrchestrator(sink, source, { stateStore: store }).run(
+        WF,
+        workflow(LINEAR)
+      );
+
+      expect(source.seeks).toEqual(["42-0"]);
+    });
+
+    it("re-dispatches in-flight work at its persisted attempt, never attempt + 1", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("b"), completion("c"));
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun([
+          { id: "a", status: "COMPLETED" },
+          { id: "b", status: "RUNNING", attempt: 2 },
+          { id: "c", status: "PENDING" },
+        ])
+      );
+
+      await new WorkflowOrchestrator(sink, source, { stateStore: store }).run(
+        WF,
+        workflow(LINEAR)
+      );
+
+      // Same attempt: a task that already ran is suppressed by the worker's
+      // claim, so resume never turns into a duplicate execution.
+      expect(sink.attempts).toEqual([2, 1]);
+    });
+
+    it("dispatches children that were unblocked but never dispatched", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("b"), completion("c"));
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun([
+          { id: "a", status: "COMPLETED" },
+          { id: "b", status: "PENDING" },
+          { id: "c", status: "PENDING" },
+        ])
+      );
+
+      const result = await new WorkflowOrchestrator(sink, source, {
+        stateStore: store,
+      }).run(WF, workflow(LINEAR));
+
+      expect(sink.waves).toEqual([["b"], ["c"]]);
+      expect(result.status).toBe("COMPLETED");
+    });
+
+    it("carries a terminal failure forward and finishes FAILED", async () => {
+      const sink = new FakeSink();
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun([
+          { id: "a", status: "FAILED" },
+          { id: "b", status: "PENDING" },
+          { id: "c", status: "PENDING" },
+        ])
+      );
+
+      const result = await new WorkflowOrchestrator(sink, new FakeSource(), {
+        stateStore: store,
+      }).run(WF, workflow(LINEAR));
+
+      expect(result.status).toBe("FAILED");
+      expect(result.failed).toEqual(["a"]);
+      expect(result.resumed).toBe(true);
+      expect(sink.waves).toEqual([]);
+    });
+
+    it("returns the persisted outcome for a finished run when resuming", async () => {
+      const sink = new FakeSink();
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun(
+          [
+            { id: "a", status: "COMPLETED" },
+            { id: "b", status: "COMPLETED" },
+            { id: "c", status: "COMPLETED" },
+          ],
+          { state: "COMPLETED", completedAt: 30 }
+        )
+      );
+
+      const result = await new WorkflowOrchestrator(sink, new FakeSource(), {
+        stateStore: store,
+      }).run(WF, workflow(LINEAR), { resume: true });
+
+      expect(result.status).toBe("COMPLETED");
+      expect(result.resumed).toBe(true);
+      expect(result.completed).toEqual(["a", "b", "c"]);
+      expect(sink.waves).toEqual([]);
+    });
+
+    it("starts a fresh run over a finished one when not resuming", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("a"), completion("b"), completion("c"));
+      const store = new FakeStateStore();
+      store.seed(
+        persistedRun(
+          [
+            { id: "a", status: "COMPLETED" },
+            { id: "b", status: "COMPLETED" },
+            { id: "c", status: "COMPLETED" },
+          ],
+          { state: "COMPLETED" }
+        )
+      );
+
+      const result = await new WorkflowOrchestrator(sink, source, {
+        stateStore: store,
+      }).run(WF, workflow(LINEAR));
+
+      expect(result.resumed).toBe(false);
+      expect(result.status).toBe("COMPLETED");
+      expect(warnSpy).toHaveBeenCalled();
+    });
+
+    it("persists the applied completions cursor", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("only"));
+      const store = new FakeStateStore();
+
+      await new WorkflowOrchestrator(sink, source, { stateStore: store }).run(
+        WF,
+        workflow(SINGLE)
+      );
+
+      const final = store.saves[store.saves.length - 1];
+      expect(final.cursor).toBe(source.cursor());
+      expect(final.cursor).not.toBe("0");
+    });
+
+    it("starts fresh (loudly) when the persisted state cannot be read", async () => {
+      const sink = new FakeSink();
+      const source = new FakeSource();
+      source.push(completion("only"));
+      const store = new FakeStateStore();
+      store.failLoad = true;
+
+      const result = await new WorkflowOrchestrator(sink, source, {
+        stateStore: store,
+      }).run(WF, workflow(SINGLE));
+
+      expect(result.status).toBe("COMPLETED");
+      expect(result.resumed).toBe(false);
+      expect(errorSpy).toHaveBeenCalled();
+    });
   });
 });
 

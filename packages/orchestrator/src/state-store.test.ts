@@ -43,6 +43,7 @@ const SNAPSHOT: WorkflowStateSnapshot = {
   state: "RUNNING",
   startedAt: 100,
   updatedAt: 200,
+  cursor: "7-0",
   failed: [],
   tasks: {
     a: {
@@ -92,6 +93,7 @@ describe("RedisWorkflowStateStore", () => {
     expect(fields["workflowId"]).toBe("wf1");
     expect(fields["state"]).toBe("RUNNING");
     expect(fields["startedAt"]).toBe("100");
+    expect(fields["cursor"]).toBe("7-0");
     expect(JSON.parse(fields["failed"])).toEqual([]);
     expect(JSON.parse(fields["tasks"])).toEqual(SNAPSHOT.tasks);
     await store.disconnect();
@@ -112,6 +114,7 @@ describe("RedisWorkflowStateStore", () => {
       startedAt: "100",
       updatedAt: "300",
       completedAt: "300",
+      cursor: "9-0",
       failed: JSON.stringify([]),
       tasks: JSON.stringify(SNAPSHOT.tasks),
     };
@@ -125,9 +128,27 @@ describe("RedisWorkflowStateStore", () => {
       startedAt: 100,
       updatedAt: 300,
       completedAt: 300,
+      cursor: "9-0",
       failed: [],
       tasks: SNAPSHOT.tasks,
     });
+    await store.disconnect();
+  });
+
+  it("defaults the cursor for state written before cursors existed", async () => {
+    redisMock.state.hash = {
+      workflowId: "wf1",
+      state: "RUNNING",
+      startedAt: "100",
+      updatedAt: "200",
+      failed: "[]",
+      tasks: JSON.stringify(SNAPSHOT.tasks),
+    };
+
+    const store = new RedisWorkflowStateStore(URL);
+    const loaded = await store.load("wf1");
+
+    expect(loaded?.cursor).toBe("0");
     await store.disconnect();
   });
 

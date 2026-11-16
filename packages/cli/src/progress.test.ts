@@ -18,6 +18,7 @@ function snapshot(records: TaskRunRecord[]): WorkflowStateSnapshot {
     state: "RUNNING",
     startedAt: 0,
     updatedAt: 0,
+    cursor: "0",
     failed: [],
     tasks,
   };

@@ -36,16 +36,28 @@ export function parseCompletionEntry(flatFields: string[]): TaskCompletion | nul
  *
  * Deliberately not a consumer group: a group would accrue a Pending Entries
  * List that nothing ever drains, which is exactly the failure mode deferred to
- * Phase 4. Orchestrator state is in-memory anyway (Phase 5 decides persistence),
- * and the orchestrator deduplicates completions, so replaying from `0` is safe.
+ * Phase 4. The cursor is owned by the orchestrator instead — it saves it to the
+ * state hash once a batch is applied, and `seek`s back to it on resume, so an
+ * interrupted run replays only what it had not yet applied. Replay is always
+ * safe because the orchestrator deduplicates completions.
  */
 export class RedisCompletionSource implements CompletionSource {
   private readonly redis: Redis;
-  private cursor = "0";
+  private cursorPosition = "0";
 
   constructor(redisUrl?: string) {
     const url = redisUrl || process.env.REDIS_URL || DEFAULT_REDIS_URL;
     this.redis = new Redis(url);
+  }
+
+  /** Position after the most recent read; persist it once that batch is applied. */
+  cursor(): string {
+    return this.cursorPosition;
+  }
+
+  /** Resume from a persisted position instead of the start of the stream. */
+  seek(cursor: string): void {
+    this.cursorPosition = cursor;
   }
 
   async read(): Promise<TaskCompletion[] | null> {
@@ -57,7 +69,7 @@ export class RedisCompletionSource implements CompletionSource {
       "64",
       "STREAMS",
       COMPLETION_STREAM,
-      this.cursor
+      this.cursorPosition
     )) as XReadReply;
 
     if (!reply || reply.length === 0) {
@@ -68,7 +80,7 @@ export class RedisCompletionSource implements CompletionSource {
 
     for (const [, entries] of reply) {
       for (const [entryId, flatFields] of entries) {
-        this.cursor = entryId;
+        this.cursorPosition = entryId;
         const completion = parseCompletionEntry(flatFields);
         if (completion) {
           completions.push(completion);

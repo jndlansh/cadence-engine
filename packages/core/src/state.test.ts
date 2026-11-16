@@ -2,9 +2,16 @@ import { describe, it, expect } from "vitest";
 import {
   initialWorkflowState,
   isTerminalWorkflowState,
+  planWorkflowResume,
   reduceWorkflowState,
+  withCursor,
 } from "./state.js";
-import type { TaskCompletion, TaskDefinition } from "./types.js";
+import type {
+  TaskCompletion,
+  TaskDefinition,
+  TaskRunRecord,
+  WorkflowStateSnapshot,
+} from "./types.js";
 
 const TASKS: TaskDefinition[] = [
   { id: "a", command: "echo a", depends_on: [], retries: 0, timeout_ms: 1000 },
@@ -39,6 +46,7 @@ describe("initialWorkflowState", () => {
     expect(state.state).toBe("PENDING");
     expect(state.startedAt).toBe(1000);
     expect(state.updatedAt).toBe(1000);
+    expect(state.cursor).toBe("0");
     expect(state.failed).toEqual([]);
     expect(Object.keys(state.tasks).sort()).toEqual(["a", "b"]);
     expect(state.tasks["a"]).toEqual({
@@ -211,5 +219,124 @@ describe("reduceWorkflowState", () => {
         at: 3,
       })
     ).toBe(state);
+  });
+});
+
+describe("withCursor", () => {
+  it("advances the persisted stream position without mutating the input", () => {
+    const state = initialWorkflowState("wf", TASKS, 0);
+    const moved = withCursor(state, "12-0");
+
+    expect(moved.cursor).toBe("12-0");
+    expect(state.cursor).toBe("0");
+  });
+
+  it("returns the same snapshot when the position has not moved", () => {
+    const state = initialWorkflowState("wf", TASKS, 0);
+    expect(withCursor(state, "0")).toBe(state);
+  });
+
+  it("never advances a terminal run", () => {
+    let state = initialWorkflowState("wf", TASKS, 0);
+    state = reduceWorkflowState(state, { type: "WORKFLOW_STARTED", at: 1 });
+    state = reduceWorkflowState(state, {
+      type: "WORKFLOW_FINISHED",
+      status: "COMPLETED",
+      at: 2,
+    });
+
+    expect(withCursor(state, "99-0")).toBe(state);
+  });
+});
+
+describe("planWorkflowResume", () => {
+  /** A RUNNING snapshot whose task records have the given statuses. */
+  function running(
+    statuses: Record<string, TaskRunRecord["status"]>
+  ): WorkflowStateSnapshot {
+    const base = initialWorkflowState("wf", TASKS, 0);
+    const tasks: Record<string, TaskRunRecord> = {};
+    for (const [id, status] of Object.entries(statuses)) {
+      const dispatched = status !== "PENDING";
+      tasks[id] = {
+        taskId: id,
+        status,
+        attempt: dispatched ? 1 : 0,
+        dispatchedAt: dispatched ? 5 : 0,
+      };
+    }
+    return { ...base, state: "RUNNING", tasks };
+  }
+
+  it("is FRESH when nothing was persisted", () => {
+    expect(planWorkflowResume(null, TASKS)).toEqual({
+      mode: "FRESH",
+      completed: [],
+      failed: [],
+      inFlight: [],
+    });
+  });
+
+  it("is FRESH when the persisted run already finished", () => {
+    const done = { ...initialWorkflowState("wf", TASKS, 0), state: "COMPLETED" as const };
+    expect(planWorkflowResume(done, TASKS).mode).toBe("FRESH");
+  });
+
+  it("splits a RUNNING run into completed, failed and in-flight", () => {
+    const plan = planWorkflowResume(
+      running({ a: "COMPLETED", b: "RUNNING" }),
+      TASKS
+    );
+
+    expect(plan.mode).toBe("RESUME");
+    expect(plan.completed).toEqual(["a"]);
+    expect(plan.failed).toEqual([]);
+    expect(plan.inFlight).toEqual([{ taskId: "b", attempt: 1 }]);
+  });
+
+  it("carries terminal failures over and leaves PENDING tasks alone", () => {
+    const plan = planWorkflowResume(
+      running({ a: "FAILED", b: "PENDING" }),
+      TASKS
+    );
+
+    expect(plan.failed).toEqual(["a"]);
+    expect(plan.inFlight).toEqual([]);
+    expect(plan.completed).toEqual([]);
+  });
+
+  it("ignores a record for a task the workflow no longer declares", () => {
+    const base = initialWorkflowState("wf", TASKS, 0);
+    const stale: WorkflowStateSnapshot = {
+      ...base,
+      state: "RUNNING",
+      tasks: {
+        ...base.tasks,
+        ghost: {
+          taskId: "ghost",
+          status: "RUNNING",
+          attempt: 1,
+          dispatchedAt: 1,
+        },
+      },
+    };
+
+    expect(planWorkflowResume(stale, TASKS).inFlight).toEqual([]);
+  });
+
+  it("treats an in-flight record with no attempt as attempt 1", () => {
+    const base = initialWorkflowState("wf", TASKS, 0);
+    const odd: WorkflowStateSnapshot = {
+      ...base,
+      state: "RUNNING",
+      tasks: {
+        ...base.tasks,
+        a: { taskId: "a", status: "RUNNING", attempt: 0, dispatchedAt: 1 },
+      },
+    };
+
+    expect(planWorkflowResume(odd, TASKS).inFlight).toEqual([
+      { taskId: "a", attempt: 1 },
+    ]);
   });
 });

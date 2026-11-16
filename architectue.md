@@ -234,7 +234,95 @@ The CLI sidesteps this by defaulting to a unique id (`<workflow>_<timestamp>`).
 **Residual window — stated plainly.** Idempotency is keyed on the *attempt*, so a task whose worker
 **died** is re-published by the reclaimer as **attempt + 1** — a new invocation — and may still run the
 command a second time. Closing that fully means either task-level (not attempt-level) dedup, or
-restart-resume reconciling `workflow:<id>:state` before re-dispatch.
+restart-resume reconciling `workflow:<id>:state` before re-dispatch — which is the next item, now done.
+
+### Restart-Resume (post-roadmap item 2b) `[STATUS: COMPLETED]`
+
+> Closes the last failure mode of Phase 5: a persisted `RUNNING` workflow used to be orphaned forever when
+> the orchestrator restarted. The run now continues exactly where it stopped.
+
+- [x] **The completions cursor is persisted** — `cursor` on `WorkflowStateSnapshot`, written to
+  `workflow:<id>:state`. The orchestrator advances it only after a read batch has been *applied*, so a
+  crash mid-batch replays that batch (harmless — completions are idempotent) instead of skipping it.
+  `CompletionSource` gained `cursor()` / `seek()`; `withCursor()` in core is the only way it moves.
+- [x] **`planWorkflowResume`** (pure, `core/src/state.ts`) reads a snapshot and returns `FRESH` (nothing
+  persisted, or the run already terminal — start over) or `RESUME` with the task records split into
+  `completed`, `failed` and `inFlight`.
+- [x] **`WorkflowOrchestrator.run(id, workflow, { resume })`**: a non-terminal snapshot is **always**
+  resumed (orphaning it is never right); a terminal one is returned as-is only when `resume: true`,
+  otherwise the run starts fresh with a warning. `WorkflowRunResult` gained `resumed`.
+- [x] **In-flight tasks are re-dispatched at their persisted attempt, never `attempt + 1`.** That is what
+  makes resume idempotent: if the task had actually finished and only its completion was lost, the
+  worker's invocation claim suppresses the re-dispatch and the completion is replayed from the cursor —
+  the command never runs twice. (A task whose *worker died* therefore stays suppressed at that attempt;
+  recovering it remains the reclaimer's job.)
+- [x] **A latent gap closed for free:** the initial wave is now dispatched from
+  `getNextExecutableTasks(completed)` rather than `getInitialTasks()`, so on resume a child that was
+  unblocked but never dispatched (crash in between) is still picked up.
+- [x] **CLI**: `run --resume` — requires an explicit `--workflow-id` (usage error, exit 2); an id with no
+  persisted state reports one clear line and exits 1.
+- [x] 20 new unit tests (core `state` +9, orchestrator +9, state-store +1, CLI program +1) → `pnpm test`
+  **152 passing**. The 8 resume tests were confirmed to **fail** against pre-resume code (without it a
+  resumed run restarts from the first task and dies at the stall guard).
+- [x] **Live-verified (2026-11-16, throwaway `memurai.exe`, stopped afterwards):** a fabricated
+  "orchestrator crashed" world — `extract` COMPLETED, `validate` in flight with its completion sitting
+  unapplied in the stream and its dead worker's claim still set — resumed to `COMPLETED`. `validate` was
+  re-dispatched at attempt 1 and the worker **suppressed** it (`duplicate delivery … skipping
+  execution`); `extract` was never re-dispatched (and has no invocation claim, so it provably never ran
+  twice). Fresh runs are unaffected, and their `cursor` is now persisted in the state hash.
+
+**Found live — worth remembering.** Renaming `RedisCompletionSource`'s private `cursor` field to
+`position` left `read()` passing `this.cursor` to `XREAD`. That reference silently became the **method**,
+so ioredis received a function as its final argument, treated it as a node-style callback, and crashed
+with `Cannot read properties of undefined (reading 'position')`. Neither `tsc` nor any unit test could
+see it — both are legal in that argument position, and `RedisCompletionSource` isn't unit-tested (the
+orchestrator tests inject a fake). Only the live run caught it. The field is now `cursorPosition`.
+
+**Still open (deliberate):** a *fresh* run that **reuses an explicit id** still starts its completions read
+at `0`, so it can replay that id's old completions. The CLI's unique-id default avoids it and `--resume`
+now covers "continue this id" properly, but cursor-at-head for fresh runs is the right fix — item 1 below.
+
+### The next six steps (logged 2026-11-16 for future reference — none of them started)
+
+Ordered so each step makes the next one safe. **Step 1 is next.**
+
+1. **Close the remaining correctness holes.**
+   - The **cross-attempt** duplicate window: the reclaimer re-publishes a dead worker's task as
+     `attempt + 1`, which a per-attempt claim cannot suppress. Either make dedup decision-level (key on
+     workflow + task and cache the outcome) or stop the reclaimer charging a retry for what is a *worker
+     death*, not a task failure.
+   - Persist bounded task stdout/stderr, so a failed run is debuggable after the fact (today output only
+     survives on the DLQ/completion).
+   - Workflow-level timeout and `cadence cancel <id>`, propagated to in-flight children.
+   - A **fresh** run with a reused explicit id should start its completions read at the stream head.
+2. **Hardening and documented debt.** `XADD … MAXLEN ~` trimming — carefully: trimming a stream that
+   still has un-acked PEL entries drops work *silently*, so trim below the group's last-delivered id.
+   Revert the redundant `redis.call("XREADGROUP", …)`. Promote the smoke/demo scripts into Redis-gated
+   integration tests wired into `pnpm test`. Worker concurrency (`COUNT 1` → N) with real backpressure.
+   Graceful shutdown that drains in-flight work. A levelled logger instead of bare `console.*`. CI:
+   typecheck + tests + a Redis service container.
+3. **Operability.** Dockerfiles and a compose file that runs the **orchestrator as a service plus N worker
+   replicas** (today `docker-compose.yml` is Redis only). Health and metrics endpoints; Prometheus metrics
+   derived from the state hash; aggregated logs. `cadence dlq list|replay|purge`, `cadence ps|logs`, and a
+   TUI/web dashboard over `workflow:*:state`.
+4. **Richer DAG semantics.** Per-task `env`/`cwd`/secrets and resource limits. Conditional/branching
+   edges, fan-out `map`, per-task retry policy with jitter, cleanup/`always` steps. Sub-workflows and
+   workflow chaining (A completes → start B).
+5. **Service surface — and the trust boundary.** An HTTP submit endpoint, webhooks, and cron scheduling
+   (reusing the Phase 4 ZSET timing primitives). **Container execution** (`docker run`): the mission
+   promises "shell/container jobs", and running arbitrary shell is remote code execution by design, so a
+   container is the isolation boundary. Then multi-tenancy: namespaces, quotas, authn/authz on submission,
+   secret management.
+6. **Packaging and release.** Publish the packages with semver, `CHANGELOG` and `LICENSE` (or ship a
+   single `cadence` entrypoint / images). A config file with a **validated env schema** — the implicit env
+   contract is already growing (`REDIS_URL`, `HEARTBEAT_*`, `RETRY_*`, `INVOCATION_TTL_SECONDS`). Docs:
+   README quickstart, architecture, operations runbook, and a **tracked** context/handoff doc, since
+   `.freebuff/` is git-ignored and does not travel with the repo. Add `.gitignore` (`dump.rdb`,
+   `.commandcode/`, `.freebuff/`). Version the persisted state schema.
+
+**Dependencies:** 1 → 2 → 3 → 4, with 5 and 6 in parallel once a single instance is trustworthy. There is
+no point exposing a service (5) or building a dashboard (3) on top of an engine that can still double-run
+work (1) or strand a run on restart (2b — now done).
 
 ---
 
@@ -266,5 +354,6 @@ Any AI assistant modifying or contributing to this repository **MUST** strictly 
    - Redis returns stream entry fields as a **flat `[field, value, field, value, ...]` array**, not an object. Never index entry fields by key without folding them first — doing so silently discards every task.
    - Terminal task outcomes are published to the `cadence:completions` stream. **Publish a completion before `XACK`**, exactly as with re-dispatch and DLQ routing: acknowledging first creates an unrecoverable window.
    - Every task attempt is claimed with `SET invocation:<invocationId> … NX` (in `core/src/invocation.ts`, key `invocation:<id>`) **before** the command runs. A delivery that loses the claim must not execute the command; it is logged and acked. Claiming before the command is deliberate — a crash after the claim stays recoverable via the PEL.
+   - The orchestrator persists its **completions cursor** in the state hash and resumes from it. A persisted non-terminal run is continued, never restarted, and an already-completed task is never re-dispatched. In-flight tasks are re-dispatched at their **persisted** attempt, so the invocation claim stays effective.
    - Never discard anything silently. A dropped task must be logged and/or routed to the DLQ; two separate bugs hid behind a silent discard.
    - Before accepting a regression test, confirm it actually **fails** against the pre-fix code.

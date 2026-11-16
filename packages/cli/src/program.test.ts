@@ -45,6 +45,7 @@ describe("createProgram", () => {
       timeoutMs: 30000,
       logFile: undefined,
       progress: true,
+      resume: false,
       redisUrl: DEFAULT_REDIS,
     });
   });
@@ -77,8 +78,25 @@ describe("createProgram", () => {
       timeoutMs: 5000,
       logFile: "run.log",
       progress: false,
+      resume: false,
       redisUrl: "redis://localhost:7000",
     });
+  });
+
+  it("parses --resume with an explicit workflow id", async () => {
+    const { program, calls } = harness();
+
+    await program.parseAsync([
+      "node",
+      "cadence",
+      "run",
+      "wf.yaml",
+      "--workflow-id",
+      "wf1",
+      "--resume",
+    ]);
+
+    expect(calls.run).toMatchObject({ workflowId: "wf1", resume: true });
   });
 
   it("routes `status <workflow-id>` with the redis url", async () => {

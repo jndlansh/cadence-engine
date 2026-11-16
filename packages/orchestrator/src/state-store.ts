@@ -45,6 +45,8 @@ export class RedisWorkflowStateStore implements WorkflowStateStore {
       String(snapshot.updatedAt),
       "completedAt",
       snapshot.completedAt === undefined ? "" : String(snapshot.completedAt),
+      "cursor",
+      snapshot.cursor,
       "failed",
       JSON.stringify(snapshot.failed),
       "tasks",
@@ -67,6 +69,7 @@ export class RedisWorkflowStateStore implements WorkflowStateStore {
         startedAt: raw["startedAt"],
         updatedAt: raw["updatedAt"],
         completedAt: raw["completedAt"] ? raw["completedAt"] : undefined,
+        cursor: raw["cursor"],
         failed: raw["failed"] ? JSON.parse(raw["failed"]) : [],
         tasks: raw["tasks"] ? JSON.parse(raw["tasks"]) : {},
       };

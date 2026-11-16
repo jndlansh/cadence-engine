@@ -167,6 +167,13 @@ export const WorkflowStateSnapshotSchema = z.object({
   startedAt: z.coerce.number().int().nonnegative(),
   updatedAt: z.coerce.number().int().nonnegative(),
   completedAt: z.coerce.number().int().nonnegative().optional(),
+  /**
+   * Position in the completions stream that this run has already applied.
+   * Persisted so a restarted orchestrator replays from exactly where it stopped
+   * instead of re-scanning the whole stream. Defaults for snapshots written
+   * before the cursor existed.
+   */
+  cursor: z.string().default("0"),
   failed: z.array(z.string()),
   tasks: z.record(z.string(), TaskRunRecordSchema),
 });

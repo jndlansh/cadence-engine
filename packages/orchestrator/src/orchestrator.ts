@@ -1,6 +1,8 @@
 import {
   initialWorkflowState,
+  planWorkflowResume,
   reduceWorkflowState,
+  withCursor,
   type ParsedWorkflow,
   type TaskCompletion,
   type TaskDefinition,
@@ -29,6 +31,14 @@ export interface TaskSink {
 export interface CompletionSource {
   /** Blocks briefly. Resolves with new completions, or null if none arrived. */
   read(): Promise<TaskCompletion[] | null>;
+  /**
+   * Stream position after the most recent `read`. The orchestrator persists it
+   * only once that batch has been applied, so a crash mid-batch replays the
+   * batch (harmless — completions are idempotent) rather than skipping it.
+   */
+  cursor(): string;
+  /** Restore a persisted position, so a resumed run replays from where it stopped. */
+  seek(cursor: string): void;
 }
 
 export type WorkflowRunStatus = TerminalWorkflowStatus;
@@ -52,14 +62,25 @@ export interface WorkflowRunResult {
   events: OrchestrationEvent[];
   /** Final lifecycle snapshot, persisted when a `stateStore` is configured. */
   state: WorkflowStateSnapshot;
+  /** True when this run continued a persisted, non-terminal run. */
+  resumed: boolean;
+}
+
+export interface WorkflowRunOptions {
+  /**
+   * When the id already has a *terminal* persisted snapshot, return that outcome
+   * instead of starting the workflow over. A non-terminal run is always resumed
+   * whether or not this is set — orphaning it is never correct.
+   */
+  resume?: boolean;
 }
 
 export interface OrchestratorOptions {
   /**
    * How long to wait without any completion before reporting the run as
-   * STALLED instead of blocking forever. Without a PEL reclaimer (Phase 4), a
-   * worker killed mid-task produces no completion at all, so this guard is what
-   * makes that condition observable rather than a silent deadlock.
+   * STALLED instead of blocking forever. A worker killed mid-task publishes no
+   * completion at all, so this guard is what makes that condition observable
+   * rather than a silent deadlock.
    */
   completionTimeoutMs?: number;
   /** Durable sink for the lifecycle snapshot. Omit to keep state in-memory. */
@@ -70,9 +91,22 @@ export interface OrchestratorOptions {
 
 const DEFAULT_COMPLETION_TIMEOUT_MS = 30_000;
 
+/** Task ids the snapshot records as terminal-completed, sorted. */
+function completedTaskIds(snapshot: WorkflowStateSnapshot): string[] {
+  return Object.values(snapshot.tasks)
+    .filter((record) => record.status === "COMPLETED")
+    .map((record) => record.taskId)
+    .sort();
+}
+
 /**
  * Walks a workflow DAG at runtime: dispatch the initial wave, observe
  * completions, dispatch newly unblocked children, repeat.
+ *
+ * When a `stateStore` is configured the walk is also **resumable**: a persisted,
+ * non-terminal run is continued instead of restarted (see `planWorkflowResume`),
+ * which is what stops an orchestrator restart from orphaning a `RUNNING`
+ * workflow. Idempotency in the worker is what makes that safe.
  *
  * Depends only on the two ports above, so the scheduling logic is unit-testable
  * without a live Redis.
@@ -99,25 +133,95 @@ export class WorkflowOrchestrator {
 
   async run(
     workflowId: string,
-    workflow: ParsedWorkflow
+    workflow: ParsedWorkflow,
+    runOptions?: WorkflowRunOptions
   ): Promise<WorkflowRunResult> {
     const resolver = workflow.resolver;
     const total = workflow.definition.tasks.length;
+    const tasksById = new Map(
+      workflow.definition.tasks.map((task) => [task.id, task])
+    );
+
+    const persisted = await this.loadPersisted(workflowId);
+    const persistedState = persisted?.state;
+
+    // A run that already finished is not silently re-run: an explicit id means
+    // "run this again", while `resume: true` asks for the prior outcome instead.
+    if (
+      persisted &&
+      (persistedState === "COMPLETED" ||
+        persistedState === "FAILED" ||
+        persistedState === "STALLED")
+    ) {
+      if (runOptions?.resume) {
+        console.log(
+          `[orchestrator] ${workflowId} already finished ${persistedState} — ` +
+            `returning the persisted outcome`
+        );
+        return {
+          workflowId,
+          status: persistedState,
+          completed: completedTaskIds(persisted),
+          failed: [...persisted.failed],
+          events: [],
+          state: persisted,
+          resumed: true,
+        };
+      }
+      console.warn(
+        `[orchestrator] ${workflowId} previously finished ${persistedState}; ` +
+          `starting a fresh run (pass --resume to keep it, or use a new id to ` +
+          `avoid replaying its completions)`
+      );
+    }
+
+    const plan = planWorkflowResume(persisted, workflow.definition.tasks);
+    const resumed = plan.mode === "RESUME";
 
     const dispatched = new Set<string>();
     const completed = new Set<string>();
     const failed: string[] = [];
     const events: OrchestrationEvent[] = [];
 
-    let snapshot = initialWorkflowState(
-      workflowId,
-      workflow.definition.tasks,
-      Date.now()
-    );
+    for (const taskId of plan.completed) {
+      completed.add(taskId);
+      dispatched.add(taskId);
+    }
+    for (const taskId of plan.failed) {
+      failed.push(taskId);
+      dispatched.add(taskId);
+    }
 
-    // Apply a transition, persist it, and log it. Persistence is best-effort:
-    // a store failure is logged and the run continues — telemetry must never be
-    // able to deadlock orchestration.
+    let snapshot =
+      resumed && persisted
+        ? persisted
+        : initialWorkflowState(workflowId, workflow.definition.tasks, Date.now());
+
+    if (resumed && persisted) {
+      // Replay exactly the completions this run had not applied yet.
+      this.source.seek(persisted.cursor);
+      console.log(
+        `[orchestrator] resuming ${workflowId} from cursor ${persisted.cursor} ` +
+          `(${plan.completed.length} completed, ${plan.failed.length} failed, ` +
+          `${plan.inFlight.length} in flight)`
+      );
+    }
+
+    // Persistence is best-effort: a store failure is logged and the run
+    // continues — telemetry must never be able to deadlock orchestration.
+    const persist = async (): Promise<void> => {
+      if (!this.stateStore) return;
+      try {
+        await this.stateStore.save(snapshot);
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[orchestrator] failed to persist workflow state: ${message}`
+        );
+      }
+    };
+
+    // Apply a transition, persist it, and log it.
     const record = async (
       event: WorkflowStateEvent,
       logType: string,
@@ -125,17 +229,7 @@ export class WorkflowOrchestrator {
       detail?: Record<string, unknown>
     ): Promise<void> => {
       snapshot = reduceWorkflowState(snapshot, event);
-
-      if (this.stateStore) {
-        try {
-          await this.stateStore.save(snapshot);
-        } catch (err: unknown) {
-          const message = err instanceof Error ? err.message : String(err);
-          console.error(
-            `[orchestrator] failed to persist workflow state: ${message}`
-          );
-        }
-      }
+      await persist();
 
       if (this.logger) {
         await this.logger.emit({
@@ -148,6 +242,15 @@ export class WorkflowOrchestrator {
       }
     };
 
+    // Persist the stream position once a read batch is fully applied, so a
+    // restart replays from here rather than re-scanning the whole stream.
+    const persistCursor = async (cursor: string): Promise<void> => {
+      const advanced = withCursor(snapshot, cursor);
+      if (advanced === snapshot) return;
+      snapshot = advanced;
+      await persist();
+    };
+
     const buildResult = (status: WorkflowRunStatus): WorkflowRunResult => ({
       workflowId,
       status,
@@ -155,6 +258,7 @@ export class WorkflowOrchestrator {
       failed: [...failed],
       events,
       state: snapshot,
+      resumed,
     });
 
     const finish = async (
@@ -172,15 +276,19 @@ export class WorkflowOrchestrator {
     // `getNextExecutableTasks` returns every task whose parents are complete,
     // and `[].every(...)` is vacuously true, so dependency-free roots come back
     // on every call. The `dispatched` filter is what stops double-dispatch.
-    const dispatch = async (candidates: TaskDefinition[]): Promise<void> => {
+    const dispatch = async (
+      candidates: TaskDefinition[],
+      attempt = 1
+    ): Promise<void> => {
       const fresh = candidates.filter((t) => !dispatched.has(t.id));
       if (fresh.length === 0) return;
 
-      const ids = await this.sink.dispatchTasks(workflowId, fresh, 1);
+      const ids = await this.sink.dispatchTasks(workflowId, fresh, attempt);
       const taskIds = fresh.map((t) => t.id);
       events.push({ type: "DISPATCHED", taskIds });
       console.log(
-        `[orchestrator] dispatched wave [${taskIds.join(", ")}] (${ids.length} entries)`
+        `[orchestrator] dispatched wave [${taskIds.join(", ")}] ` +
+          `(attempt ${attempt}, ${ids.length} entries)`
       );
 
       for (const task of fresh) {
@@ -189,12 +297,12 @@ export class WorkflowOrchestrator {
           {
             type: "TASK_DISPATCHED",
             taskId: task.id,
-            attempt: 1,
+            attempt,
             at: Date.now(),
           },
           "TASK_DISPATCHED",
           [task.id],
-          { attempt: 1 }
+          { attempt }
         );
       }
     };
@@ -204,7 +312,28 @@ export class WorkflowOrchestrator {
       "WORKFLOW_STARTED",
       []
     );
-    await dispatch(resolver.getInitialTasks());
+
+    // Re-dispatch what was in flight when the run stopped, at its persisted
+    // attempt. If the task had in fact finished (only the completion was lost),
+    // the worker's invocation claim makes this a no-op and the completion
+    // arrives from the replayed stream — so nothing runs twice.
+    if (resumed) {
+      const byAttempt = new Map<number, TaskDefinition[]>();
+      for (const { taskId, attempt } of plan.inFlight) {
+        const task = tasksById.get(taskId);
+        if (!task) continue;
+        const group = byAttempt.get(attempt) ?? [];
+        group.push(task);
+        byAttempt.set(attempt, group);
+      }
+      for (const [attempt, group] of byAttempt) {
+        await dispatch(group, attempt);
+      }
+    }
+
+    // Covers both the initial wave of a fresh run and any children that were
+    // unblocked by seeded completions but never dispatched before the crash.
+    await dispatch(resolver.getNextExecutableTasks(completed));
 
     let lastProgressAt = Date.now();
 
@@ -285,6 +414,30 @@ export class WorkflowOrchestrator {
           );
         }
       }
+
+      // Every entry in the batch has been applied (or deliberately ignored), so
+      // the position is now safe to persist.
+      await persistCursor(this.source.cursor());
+    }
+  }
+
+  /**
+   * Load a persisted snapshot for this id. Best-effort: a store that cannot be
+   * read must not stop the run — it is logged and the run starts fresh.
+   */
+  private async loadPersisted(
+    workflowId: string
+  ): Promise<WorkflowStateSnapshot | null> {
+    if (!this.stateStore) return null;
+    try {
+      return await this.stateStore.load(workflowId);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(
+        `[orchestrator] failed to load persisted state for ${workflowId}: ` +
+          `${message} — starting fresh`
+      );
+      return null;
     }
   }
 }

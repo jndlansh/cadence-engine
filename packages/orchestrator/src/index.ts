@@ -6,6 +6,7 @@ export {
   type OrchestrationEventType,
   type OrchestratorOptions,
   type TaskSink,
+  type WorkflowRunOptions,
   type WorkflowRunResult,
   type WorkflowRunStatus,
 } from "./orchestrator.js";

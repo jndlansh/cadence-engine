@@ -24,6 +24,8 @@ export interface RunOptions {
   timeoutMs: number;
   logFile?: string;
   progress: boolean;
+  /** Continue an existing run instead of starting over (needs an explicit id). */
+  resume: boolean;
   redisUrl: string;
 }
 
@@ -54,6 +56,12 @@ export async function runCommand(options: RunOptions): Promise<number> {
     console.error(
       `[cadence] ${err instanceof Error ? err.message : String(err)}`
     );
+    return USAGE_ERROR;
+  }
+
+  // Resuming needs a specific run to continue; a generated id could never match.
+  if (options.resume && !options.workflowId) {
+    console.error("[cadence] --resume requires an explicit --workflow-id <id>");
     return USAGE_ERROR;
   }
 
@@ -92,6 +100,15 @@ export async function runCommand(options: RunOptions): Promise<number> {
   try {
     await dispatcher.ensureGroup();
 
+    // An explicit resume of a run we have no state for is a mistake worth
+    // reporting, rather than silently starting a fresh run under that id.
+    if (options.resume && !(await store.load(workflowId))) {
+      console.error(
+        `[cadence] no persisted state for ${workflowId} — nothing to resume`
+      );
+      return 1;
+    }
+
     pool = await spawnWorkers({
       count: options.workers,
       redisUrl: options.redisUrl,
@@ -110,7 +127,9 @@ export async function runCommand(options: RunOptions): Promise<number> {
       logger,
     });
 
-    const result = await orchestrator.run(workflowId, workflow);
+    const result = await orchestrator.run(workflowId, workflow, {
+      resume: options.resume,
+    });
 
     const failedSuffix =
       result.failed.length > 0 ? `, failed [${result.failed.join(", ")}]` : "";

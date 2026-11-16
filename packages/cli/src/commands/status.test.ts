@@ -8,6 +8,7 @@ const SNAPSHOT: WorkflowStateSnapshot = {
   startedAt: Date.UTC(2026, 0, 1),
   updatedAt: Date.UTC(2026, 0, 1, 0, 0, 5),
   completedAt: Date.UTC(2026, 0, 1, 0, 0, 5),
+  cursor: "3-0",
   failed: ["aggregate"],
   tasks: {
     extract: {

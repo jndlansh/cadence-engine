@@ -39,6 +39,10 @@ export function createProgram(handlers: Handlers): Command {
     .option("--log <file>", "also write a JSON-lines event log")
     .option("--no-progress", "disable the live progress bar")
     .option(
+      "--resume",
+      "continue an existing run instead of starting over (requires --workflow-id)"
+    )
+    .option(
       "--redis-url <url>",
       "Redis connection string",
       "redis://127.0.0.1:6379"
@@ -51,6 +55,7 @@ export function createProgram(handlers: Handlers): Command {
         timeoutMs: Number(options.timeout),
         logFile: str(options.log),
         progress: options.progress !== false,
+        resume: options.resume === true,
         redisUrl: str(options.redisUrl) ?? "redis://127.0.0.1:6379",
       });
     });
