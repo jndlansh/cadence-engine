@@ -17,6 +17,7 @@ import {
   hasRetryBudget,
   invocationKey,
   invocationOutcomeKey,
+  truncateOutput,
   type BackoffOptions,
   type InvocationClaim,
   type TaskCompletion,
@@ -264,6 +265,7 @@ export class WorkerConsumer {
     invocationId: string,
     result: TaskExecutionResult
   ): Promise<void> {
+    const captured = this.capture(result);
     try {
       await this.redis.set(
         invocationOutcomeKey(invocationId),
@@ -272,11 +274,9 @@ export class WorkerConsumer {
           exitCode: result.exitCode,
           durationMs: result.durationMs,
           timedOut: result.timedOut,
-          error: result.error
-            ? result.error.message
-            : result.status === "FAILED"
-              ? result.stderr
-              : "",
+          error: captured.error,
+          stdout: captured.stdout,
+          stderr: captured.stderr,
         }),
         "EX",
         this.invocationTtlSeconds
@@ -368,6 +368,29 @@ export class WorkerConsumer {
   }
 
   /**
+   * The bounded output capture for a result: the failure reason plus both
+   * streams, each bound so the completion entry and the persisted state hash stay
+   * small. One definition, so the outcome record and the completion always agree.
+   */
+  private capture(result: TaskExecutionResult): {
+    error: string;
+    stdout: string;
+    stderr: string;
+  } {
+    return {
+      error: truncateOutput(
+        result.error
+          ? result.error.message
+          : result.status === "FAILED"
+            ? result.stderr
+            : ""
+      ),
+      stdout: truncateOutput(result.stdout),
+      stderr: truncateOutput(result.stderr),
+    };
+  }
+
+  /**
    * Publish the terminal outcome of a task so the orchestrator can advance the
    * DAG. Called before `safeXack`: a crash in between simply re-delivers the
    * task and produces a duplicate completion, which the orchestrator treats
@@ -381,6 +404,7 @@ export class WorkerConsumer {
   ): Promise<void> {
     const status: TaskCompletion["status"] =
       result.status === "COMPLETED" ? "COMPLETED" : "FAILED";
+    const captured = this.capture(result);
 
     await this.redis.xadd(
       COMPLETION_STREAM,
@@ -400,11 +424,11 @@ export class WorkerConsumer {
       "timedOut",
       String(result.timedOut),
       "error",
-      result.error
-        ? result.error.message
-        : result.status === "FAILED"
-          ? result.stderr
-          : ""
+      captured.error,
+      "stdout",
+      captured.stdout,
+      "stderr",
+      captured.stderr
     );
   }
 
@@ -470,9 +494,9 @@ export class WorkerConsumer {
       "exitCode",
       String(result.exitCode),
       "stdout",
-      result.stdout,
+      truncateOutput(result.stdout),
       "stderr",
-      result.stderr,
+      truncateOutput(result.stderr),
       "timedOut",
       String(result.timedOut),
       "durationMs",

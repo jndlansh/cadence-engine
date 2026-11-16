@@ -308,7 +308,11 @@ export class TaskReclaimer {
       "timedOut",
       String(outcome.timedOut),
       "error",
-      outcome.error ?? ""
+      outcome.error ?? "",
+      "stdout",
+      outcome.stdout ?? "",
+      "stderr",
+      outcome.stderr ?? ""
     );
   }
 

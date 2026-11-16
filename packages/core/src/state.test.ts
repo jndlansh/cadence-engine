@@ -188,6 +188,59 @@ describe("reduceWorkflowState", () => {
     ).toBe(state);
   });
 
+  it("keeps the task's bounded output capture on its record", () => {
+    let state = initialWorkflowState("wf", TASKS, 0);
+    state = reduceWorkflowState(state, { type: "WORKFLOW_STARTED", at: 1 });
+    state = reduceWorkflowState(state, {
+      type: "TASK_COMPLETED",
+      completion: completion("a", { stdout: "printed this", stderr: "" }),
+      at: 10,
+    });
+
+    expect(state.tasks["a"].stdout).toBe("printed this");
+    expect(state.tasks["a"].stderr).toBe("");
+  });
+
+  it("leaves output absent when the completion carries none", () => {
+    let state = initialWorkflowState("wf", TASKS, 0);
+    state = reduceWorkflowState(state, { type: "WORKFLOW_STARTED", at: 1 });
+    state = reduceWorkflowState(state, {
+      type: "TASK_COMPLETED",
+      completion: completion("a"),
+      at: 10,
+    });
+
+    expect(state.tasks["a"].stdout).toBeUndefined();
+    expect(state.tasks["a"].stderr).toBeUndefined();
+  });
+
+  it("stores a producer's bounded capture verbatim", () => {
+    const producerCapture = `zzz…[output truncated: 4904 more characters]`;
+
+    let state = initialWorkflowState("wf", TASKS, 0);
+    state = reduceWorkflowState(state, {
+      type: "TASK_COMPLETED",
+      completion: completion("a", { stdout: producerCapture }),
+      at: 10,
+    });
+
+    // The honest count survives; re-cutting would replace it with a smaller one.
+    expect(state.tasks["a"].stdout).toBe(producerCapture);
+  });
+
+  it("cuts output beyond any conforming capture", () => {
+    let state = initialWorkflowState("wf", TASKS, 0);
+    state = reduceWorkflowState(state, {
+      type: "TASK_COMPLETED",
+      completion: completion("a", { stdout: "z".repeat(50_000) }),
+      at: 10,
+    });
+
+    // Whatever a completion claims, the persisted snapshot stays bounded.
+    expect(state.tasks["a"].stdout).toContain("output truncated");
+    expect(state.tasks["a"].stdout?.length).toBeLessThan(5000);
+  });
+
   it("finishes with the given terminal status and stamps completedAt", () => {
     let state = initialWorkflowState("wf", TASKS, 0);
     state = reduceWorkflowState(state, { type: "WORKFLOW_STARTED", at: 1 });

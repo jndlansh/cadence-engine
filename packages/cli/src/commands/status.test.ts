@@ -58,4 +58,33 @@ describe("formatStatus", () => {
       formatStatus({ ...SNAPSHOT, failed: [] })
     ).toContain("failed   : -");
   });
+
+  it("shows a failed task's captured output", () => {
+    const out = formatStatus({
+      ...SNAPSHOT,
+      tasks: {
+        ...SNAPSHOT.tasks,
+        aggregate: {
+          ...SNAPSHOT.tasks.aggregate,
+          stdout: "about to fail",
+          stderr: "boom",
+        },
+      },
+    });
+
+    expect(out).toContain("stdout: about to fail");
+    expect(out).toContain("stderr: boom");
+  });
+
+  it("keeps a successful task's row compact", () => {
+    const out = formatStatus({
+      ...SNAPSHOT,
+      tasks: {
+        ...SNAPSHOT.tasks,
+        extract: { ...SNAPSHOT.tasks.extract, stdout: "noisy output" },
+      },
+    });
+
+    expect(out).not.toContain("noisy output");
+  });
 });

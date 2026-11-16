@@ -68,6 +68,8 @@ describe("invocation outcome records", () => {
     durationMs: 1000,
     timedOut: true,
     error: "timed out",
+    stdout: "partial output",
+    stderr: "timed out",
   };
 
   it("namespaces the outcome key under the invocation id", () => {
@@ -89,6 +91,8 @@ describe("invocation outcome records", () => {
       durationMs: 5,
       timedOut: false,
       error: "",
+      stdout: "hello",
+      stderr: "",
     };
 
     expect(decodeInvocationOutcome(encodeInvocationOutcome(clean))).toEqual(

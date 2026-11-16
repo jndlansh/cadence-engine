@@ -16,6 +16,7 @@ import {
   type WorkflowLifecycleState,
   type WorkflowStateSnapshot,
 } from "./types.js";
+import { boundReceivedOutput } from "./output.js";
 
 /** States from which no further transition is allowed. */
 export const TERMINAL_WORKFLOW_STATES: ReadonlySet<WorkflowLifecycleState> =
@@ -128,6 +129,12 @@ export function reduceWorkflowState(
         exitCode: completion.exitCode,
         timedOut: completion.timedOut,
         error: completion.error,
+        // Re-bounded here as well as in the worker: whatever arrives on the wire,
+        // the persisted snapshot stays bounded, because everything downstream
+        // (HGETALL, the CLI, a future dashboard) reads this hash. A capture the
+        // worker already bounded is stored verbatim.
+        stdout: boundReceivedOutput(completion.stdout),
+        stderr: boundReceivedOutput(completion.stderr),
       };
 
       const isNewFailure =

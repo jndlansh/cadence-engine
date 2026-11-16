@@ -93,6 +93,14 @@ export const TaskCompletionSchema = z.object({
   timedOut: streamBoolean,
   /** Failure detail (spawn error or captured stderr). Absent on success. */
   error: z.string().optional(),
+  /**
+   * Bounded capture of what the task printed, so a finished run stays
+   * debuggable after the fact. Bounded by the worker (`truncateOutput`), so
+   * these are already cut when they arrive on the wire. Optional because an
+   * entry published by an older worker carries neither.
+   */
+  stdout: z.string().optional(),
+  stderr: z.string().optional(),
 });
 
 export type TaskCompletion = z.infer<typeof TaskCompletionSchema>;
@@ -151,6 +159,9 @@ export const TaskRunRecordSchema = z.object({
   exitCode: z.number().int().optional(),
   timedOut: z.boolean().optional(),
   error: z.string().optional(),
+  /** Bounded capture of the task's output, kept so a run is debuggable later. */
+  stdout: z.string().optional(),
+  stderr: z.string().optional(),
 });
 
 export type TaskRunRecord = z.infer<typeof TaskRunRecordSchema>;

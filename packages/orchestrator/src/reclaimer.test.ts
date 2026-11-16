@@ -214,6 +214,8 @@ describe("TaskReclaimer.sweepOnce", () => {
       durationMs: 42,
       timedOut: false,
       error: "",
+      stdout: "the work happened",
+      stderr: "",
     });
 
     const reclaimer = new TaskReclaimer(URL, { minIdleMs: 5000 });
@@ -250,6 +252,10 @@ describe("TaskReclaimer.sweepOnce", () => {
       "timedOut",
       "false",
       "error",
+      "",
+      "stdout",
+      "the work happened",
+      "stderr",
       "",
     ]);
     await reclaimer.disconnect();

@@ -384,7 +384,28 @@ describe("WorkerConsumer.handleMessage", () => {
       durationMs: expect.any(Number),
       timedOut: false,
       error: "",
+      stdout: "hi",
+      stderr: "",
     });
+  });
+
+  it("carries the captured output on the completion", async () => {
+    const consumer = new WorkerConsumer("redis://127.0.0.1:6379");
+
+    await internals(consumer).handleMessage("14-0", {
+      workflowId: "w1",
+      taskId: "chatty",
+      command: 'node -e "console.log(\\"to stdout\\"); console.error(\\"to stderr\\")"',
+      timeoutMs: "5000",
+      retries: "0",
+      attempt: "1",
+    });
+
+    const completion = redisMock.xadd.mock.calls[0];
+    expect(completion).toContain("stdout");
+    expect(completion).toContain("to stdout");
+    expect(completion).toContain("stderr");
+    expect(completion).toContain("to stderr");
   });
 
   it("does not record an outcome for a failure that still has retry budget", async () => {

@@ -43,8 +43,10 @@ cadence/
     │   ├── src/retry.test.ts        # Vitest suite for backoff delays & payload encoding
     │   ├── src/state.ts             # Pure workflow lifecycle state machine (reducer)
     │   ├── src/state.test.ts        # Vitest suite for lifecycle transitions
-    │   ├── src/invocation.ts        # Pure idempotency contract: invocation id, claim key, decision
-    │   ├── src/invocation.test.ts   # Vitest suite for id building, key naming & claim decisions
+    │   ├── src/invocation.ts        # Pure idempotency contract: id, claim + outcome keys, decisions
+    │   ├── src/invocation.test.ts   # Vitest suite for ids, keys, outcome codec & claim decisions
+    │   ├── src/output.ts            # Task output capture policy: bounded stdout/stderr (+ marker)
+    │   ├── src/output.test.ts       # Vitest suite for the capture bound, marker & receiver envelope
     │   └── src/index.ts             # Core package barrel export
     ├── orchestrator/                # Coordination layer & scheduler daemon
     │   ├── src/scheduler.ts         # Redis Streams task dispatcher (XADD)
@@ -347,6 +349,36 @@ record, so its task is re-dispatched and the command runs again — at-least-onc
 needs the *task* to be idempotent, and the natural lever is the invocation id, which the runner could
 expose to the command as an env var (`CADENCE_INVOCATION_ID`). Logged for step 4 (per-task `env`).
 
+### Durable Task Output (step 1, item 2) `[STATUS: COMPLETED]`
+
+> A task's stdout/stderr was discarded the moment the process exited. A successful task kept nothing, and
+> a failed one survived only as the `error` string (plus a transient DLQ entry).
+
+- [x] **A bounded capture travels with the completion and is persisted per task** — `stdout`/`stderr` on
+  `TaskCompletion` and on `TaskRunRecord`, so `HGET workflow:<id>:state tasks` (and `cadence status`) shows
+  what every task printed. The recorded `InvocationOutcome` carries them too, so a replayed completion
+  (item 1) is faithful rather than losing the output.
+- [x] **`core/src/output.ts` owns the policy** (pure): `MAX_PERSISTED_OUTPUT_CHARS` (4096) per stream,
+  `truncateOutput` for the producer, `boundReceivedOutput` for the receiver, and `OUTPUT_MARKER_ALLOWANCE`.
+- [x] **A cut capture says so, and the count is honest.** `truncateOutput` keeps the head and appends
+  `…[output truncated: N more characters]`. The **receiver** role matters: the reducer stores anything
+  inside the conforming envelope *verbatim* and only cuts a value no conforming producer could have
+  written. The first cut of this re-cut the worker's output, replacing an honest "4904 more characters"
+  with a misleading "41" — found by live verification, and now pinned by a test.
+- [x] Bounded separately per stream, so a chatty stdout cannot crowd out the stderr that explains a
+  failure; the DLQ payload is bounded too (it was previously unbounded).
+- [x] **CLI**: `cadence status` prints a failed task's captured output under its row (already bounded);
+  successful rows stay compact, with the full capture always in the state hash.
+- [x] 16 new unit tests (core `output` +9, core `state` +4, worker `consumer` +1, CLI `status` +2; the
+  existing `invocation`/`reclaimer` suites were updated for the new fields) → `pnpm test` **187 passing**.
+  Four were confirmed to **fail** pre-fix, across all three layers (worker completion, reclaimer replay,
+  CLI rendering).
+- [x] **Live-verified (2026-11-16, throwaway `memurai.exe`, stopped afterwards):** a two-task workflow
+  whose second task floods 9000 characters and exits 2 produced a persisted `chatty_ok.stdout` =
+  "line one | line two" (previously *nothing* was kept for a successful task) and a bounded
+  `flood_then_fail.stdout` of 4137 chars ending in `…[output truncated: 4904 more characters]`;
+  `cadence status` rendered both the `stderr` (`flooded then died`) and the truncated `stdout`.
+
 ### The next six steps (logged 2026-11-16 for future reference — none of them started)
 
 Ordered so each step makes the next one safe. **Step 1 is next.**
@@ -354,8 +386,8 @@ Ordered so each step makes the next one safe. **Step 1 is next.**
 1. **Close the remaining correctness holes.**
    - ✅ **DONE 2026-11-16 — cross-attempt duplicate window** (see the section above): the worker records a
      terminal outcome and the reclaimer replays it instead of re-running the command.
-   - Persist bounded task stdout/stderr, so a failed run is debuggable after the fact (today output only
-     survives on the DLQ/completion).
+   - ✅ **DONE 2026-11-16 — durable task output** (see the section above): a bounded stdout/stderr capture
+     is persisted per task, in the state hash and in `cadence status`.
    - Workflow-level timeout and `cadence cancel <id>`, propagated to in-flight children.
    - Expose the invocation id to the task itself (e.g. `CADENCE_INVOCATION_ID`), so a command that *must*
      be idempotent has the lever to be — the mission promises this and nothing currently provides it.

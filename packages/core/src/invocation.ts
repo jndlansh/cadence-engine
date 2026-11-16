@@ -85,6 +85,9 @@ export const InvocationOutcomeSchema = z.object({
   timedOut: z.boolean(),
   /** Failure detail exactly as the completion carries it (may be empty). */
   error: z.string().optional(),
+  /** Bounded output capture, carried so a replayed outcome is faithful. */
+  stdout: z.string().optional(),
+  stderr: z.string().optional(),
 });
 
 export type InvocationOutcome = z.infer<typeof InvocationOutcomeSchema>;
@@ -102,6 +105,8 @@ export function encodeInvocationOutcome(outcome: InvocationOutcome): string {
     durationMs: outcome.durationMs,
     timedOut: outcome.timedOut,
     error: outcome.error ?? "",
+    stdout: outcome.stdout ?? "",
+    stderr: outcome.stderr ?? "",
   });
 }
 

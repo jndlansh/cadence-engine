@@ -13,7 +13,21 @@ function formatTask(id: string, record: TaskRunRecord): string {
   if (record.timedOut) bits.push("timed out");
   if (record.error) bits.push(`error: ${record.error}`);
 
-  return `  ${id.padEnd(16)} ${bits.join("  ")}`;
+  const lines = [`  ${id.padEnd(16)} ${bits.join("  ")}`];
+
+  // A failure is the case worth reading in full, so show what it printed. The
+  // capture is already bounded, and every task's output stays available in the
+  // state hash (`HGET workflow:<id>:state tasks`) whether it passed or failed.
+  if (record.status === "FAILED") {
+    for (const [label, text] of [
+      ["stdout", record.stdout],
+      ["stderr", record.stderr],
+    ] as const) {
+      if (text) lines.push(`    ${label}: ${text}`);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 /**
